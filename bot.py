@@ -7,8 +7,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from openai import OpenAI
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_KEY = os.environ["OPENAI_API_KEY"]
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
+if not OPENAI_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY env var")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -17,13 +22,12 @@ client = OpenAI(api_key=OPENAI_KEY)
 last_bot_time = 0
 mute_until = 0
 
-# Храним последние сообщения для анализа
 recent_messages = deque(maxlen=20)
 
 NEGATIVE_TRIGGERS = [
     "перегнул", "заткнись", "не смешно",
     "охренел", "заебал", "отвали", "хватит",
-    "иди нах", "ты че", "тормози"
+    "иди нах", "тормози", "ты че"
 ]
 
 SYSTEM_PROMPT = """
@@ -45,10 +49,10 @@ SYSTEM_PROMPT = """
 def group_push_detected():
     negative_count = 0
     for msg in list(recent_messages)[-5:]:
-        low = msg.lower()
-        if any(word in low for word in NEGATIVE_TRIGGERS):
+        if any(word in msg for word in NEGATIVE_TRIGGERS):
             negative_count += 1
     return negative_count >= 3
+
 
 @dp.message()
 async def handle_message(message: Message):
@@ -60,34 +64,37 @@ async def handle_message(message: Message):
     if not message.text:
         return
 
-    recent_messages.append(message.text)
+    text = message.text.lower()
+    recent_messages.append(text)
 
     now = time.time()
 
-    # Если бот в паузе
+    # если бот в паузе
     if now < mute_until:
         return
 
-    # Если группа начала пушить
+    # если группа его пушит
     if group_push_detected():
         await message.answer(random.choice([
             "Окей, перегнул. Бывает.",
             "Ладно, сегодня без огня.",
             "Понял, снимаю обороты."
         ]))
-        mute_until = now + 3600  # 1 час паузы
+        mute_until = now + 3600
         return
 
-    # Не чаще чем раз в 8–15 минут
-    if now - last_bot_time < random.randint(480, 900):
-        return
-
-    # Непредсказуемый шанс вмешательства
-    if random.random() > 0.18:
-        return
-
-    await bot.send_chat_action(message.chat.id, "typing")
-    await asyncio.sleep(random.randint(5, 15))
+    # 🔥 если его явно позвали — отвечаем сразу
+    if "бот" in text or f"@{(await bot.me()).username.lower()}" in text:
+        await bot.send_chat_action(message.chat.id, "typing")
+        await asyncio.sleep(2)
+    else:
+        # иначе обычная логика (непредсказуемость)
+        if now - last_bot_time < random.randint(480, 900):
+            return
+        if random.random() > 0.18:
+            return
+        await bot.send_chat_action(message.chat.id, "typing")
+        await asyncio.sleep(random.randint(5, 15))
 
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
@@ -101,13 +108,12 @@ async def handle_message(message: Message):
 
     reply = response.choices[0].message.content
 
-    # Разбиваем на 1–3 сообщения
     parts = reply.split("\n")
     parts = [p.strip() for p in parts if p.strip()]
 
     for part in parts[:3]:
         await message.answer(part)
-        await asyncio.sleep(random.randint(2, 5))
+        await asyncio.sleep(1)
 
     last_bot_time = now
 
