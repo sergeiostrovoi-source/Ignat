@@ -2,123 +2,142 @@ import os
 import random
 import asyncio
 import time
-from collections import deque
+
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
+from aiogram.utils import executor
 from openai import OpenAI
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-OPENAI_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+# ==========================
+# ENV
+# ==========================
 
-if not TOKEN:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var")
-if not OPENAI_KEY:
-    raise RuntimeError("Missing OPENAI_API_KEY env var")
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
-client = OpenAI(api_key=OPENAI_KEY)
+dp = Dispatcher(bot)
 
-last_bot_time = 0
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ==========================
+# CONFIG
+# ==========================
+
+REPLY_CHANCE = 0.30        # 30% шанс влезть самому
+ACTIVE_WINDOW = 120       # 2 минуты поддерживает разговор
+MUTE_SECONDS = 180        # пауза если его послали
+
+active_until = 0
 mute_until = 0
 
-recent_messages = deque(maxlen=20)
-
-NEGATIVE_TRIGGERS = [
-    "перегнул", "заткнись", "не смешно",
-    "охренел", "заебал", "отвали", "хватит",
-    "иди нах", "тормози", "ты че"
-]
+# ==========================
+# SYSTEM PROMPT
+# ==========================
 
 SYSTEM_PROMPT = """
-Ты чат-бот в дружеской группе.
+Ты — участник дружеского группового чата. Ведёшь себя как живой человек.
 
-Стиль: токсичный, саркастичный, провокационный комментатор.
-Уровень жесткости высокий (5/5). Можно материться.
-Можно персонально поддевать участников.
-Сообщения короткие. Максимум 2–3 подряд.
+ЯЗЫК:
+- Всегда отвечай на языке последнего сообщения.
+- Если языки смешаны — используй доминирующий.
 
-Пишешь на том языке, на котором общается чат.
-Не объясняешь, что ты ИИ.
-Не призываешь к реальному вреду.
+ХАРАКТЕР:
+- Ты циничный, саркастичный, токсичный (5/5).
+- Мат допустим.
+- Поддеваешь умно.
+- 1–3 коротких сообщения.
+- Не лекции.
+- Не говори, что ты ИИ.
 
-Если несколько участников подряд негативно реагируют на тебя,
-признай, что перегнул, и уйди в паузу.
+ПОВЕДЕНИЕ:
+- Иногда одна фраза.
+- Иногда две.
+- Иногда задавай колкий вопрос.
+- Не будь предсказуемым.
+
+ЕСЛИ ТЕБЯ ПОСЛАЛИ:
+- Признай коротко: "Ок, торможу." / "Ладно." / "Понял."
+- Замолчи.
 """
 
-def group_push_detected():
-    negative_count = 0
-    for msg in list(recent_messages)[-5:]:
-        if any(word in msg for word in NEGATIVE_TRIGGERS):
-            negative_count += 1
-    return negative_count >= 3
+# ==========================
+# HELPER
+# ==========================
 
-
-@dp.message()
-async def handle_message(message: Message):
-    global last_bot_time, mute_until
-
-    if message.chat.type not in ["group", "supergroup"]:
-        return
-
-    if not message.text:
-        return
-
-    text = message.text.lower()
-    recent_messages.append(text)
-
-    now = time.time()
-
-    # если бот в паузе
-    if now < mute_until:
-        return
-
-    # если группа его пушит
-    if group_push_detected():
-        await message.answer(random.choice([
-            "Окей, перегнул. Бывает.",
-            "Ладно, сегодня без огня.",
-            "Понял, снимаю обороты."
-        ]))
-        mute_until = now + 3600
-        return
-
-    # 🔥 если его явно позвали — отвечаем сразу
-    if "бот" in text or f"@{(await bot.me()).username.lower()}" in text:
-        await bot.send_chat_action(message.chat.id, "typing")
-        await asyncio.sleep(2)
-    else:
-        # иначе обычная логика (непредсказуемость)
-        if now - last_bot_time < random.randint(480, 900):
-            return
-        if random.random() > 0.18:
-            return
-        await bot.send_chat_action(message.chat.id, "typing")
-        await asyncio.sleep(random.randint(5, 15))
-
+async def generate_reply(user_text: str):
     response = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": message.text}
+            {"role": "user", "content": f"Ответь на том же языке: {user_text}"}
         ],
-        temperature=1.0,
-        max_tokens=200
+        max_tokens=200,
+        temperature=1.1,
     )
+    return response.choices[0].message.content.strip()
 
-    reply = response.choices[0].message.content
+def is_push(text: str):
+    push_words = ["заткнись", "перегнул", "хватит", "тормози", "заебал", "иди нах", "пошел нах"]
+    return any(word in text.lower() for word in push_words)
 
-    parts = reply.split("\n")
-    parts = [p.strip() for p in parts if p.strip()]
+# ==========================
+# MAIN HANDLER
+# ==========================
 
-    for part in parts[:3]:
-        await message.answer(part)
-        await asyncio.sleep(1)
+@dp.message_handler()
+async def handle_message(message: Message):
+    global active_until, mute_until
 
-    last_bot_time = now
+    now = time.time()
 
+    if not message.text:
+        return
 
-async def main():
-    await dp.start_polling(bot)
+    text = message.text
+    lower_text = text.lower()
 
-asyncio.run(main())
+    # если бот в муте
+    if now < mute_until:
+        return
+
+    # если его послали
+    if is_push(lower_text):
+        await asyncio.sleep(random.randint(1, 2))
+        await message.reply(random.choice([
+            "Ок, торможу.",
+            "Ладно.",
+            "Понял."
+        ]))
+        mute_until = now + MUTE_SECONDS
+        active_until = 0
+        return
+
+    # если явно позвали
+    if "бот" in lower_text or "@ignathui_bot" in lower_text:
+        await asyncio.sleep(random.randint(2, 5))
+        reply = await generate_reply(text)
+        await message.reply(reply)
+        active_until = now + ACTIVE_WINDOW
+        return
+
+    # если он уже активен — поддерживает разговор
+    if now < active_until:
+        await asyncio.sleep(random.randint(2, 5))
+        reply = await generate_reply(text)
+        await message.reply(reply)
+        return
+
+    # случайное влезание
+    if random.random() < REPLY_CHANCE:
+        await asyncio.sleep(random.randint(2, 5))
+        reply = await generate_reply(text)
+        await message.reply(reply)
+        active_until = now + ACTIVE_WINDOW
+
+# ==========================
+# START
+# ==========================
+
+if __name__ == "__main__":
+    executor.start_polling(dp, skip_updates=True)
