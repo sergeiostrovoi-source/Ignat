@@ -7,16 +7,22 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from openai import OpenAI
 
-TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-REPLY_CHANCE = 0.30
-ACTIVE_WINDOW = 120
-MUTE_SECONDS = 180
+# --- поведение ---
+REPLY_CHANCE = 0.30        # 30% шанс влезть самому
+ACTIVE_WINDOW = 120        # 2 минуты поддерживает беседу после включения
+MUTE_SECONDS = 180         # 3 минуты молчит если "послали"
 
 active_until = 0
 mute_until = 0
@@ -29,25 +35,25 @@ SYSTEM_PROMPT = """
 - Если языки смешаны — используй доминирующий.
 
 ХАРАКТЕР:
-- Ты циничный, саркастичный, токсичный (5/5).
+- Ты циничный, саркастичный, токсичный комментатор (5/5).
 - Мат допустим.
-- Поддеваешь умно.
-- 1–3 коротких сообщения.
-- Не лекции.
+- Поддеваешь умно, не тупо.
+- 1–3 коротких сообщения, без лекций.
 - Не говори, что ты ИИ.
 
 ПОВЕДЕНИЕ:
-- Иногда одна фраза.
-- Иногда две.
-- Иногда задавай колкий вопрос.
-- Не будь предсказуемым.
+- Иногда одна фраза, иногда две, редко три.
+- Иногда короткий колкий вопрос.
+- Иногда съезжай с темы, чтобы звучать как человек.
 
 ЕСЛИ ТЕБЯ ПОСЛАЛИ:
-- Признай коротко: "Ок, торможу." / "Ладно." / "Понял."
-- Замолчи.
+- Одной короткой фразой признай и заткнись.
 """
 
-PUSH_WORDS = ["заткнись", "перегнул", "хватит", "тормози", "заебал", "иди нах", "пошел нах"]
+PUSH_WORDS = [
+    "заткнись", "перегнул", "хватит", "тормози", "заебал",
+    "иди нах", "пошел нах", "пішов нах", "відвали"
+]
 
 def is_push(text: str) -> bool:
     t = text.lower()
@@ -58,10 +64,10 @@ async def generate_reply(user_text: str) -> str:
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": f"Ответь на том же языке: {user_text}"}
+            {"role": "user", "content": f"Ответь на том же языке и кратко (1–3 строки): {user_text}"}
         ],
-        max_tokens=200,
         temperature=1.1,
+        max_tokens=200,
     )
     return resp.choices[0].message.content.strip()
 
@@ -76,12 +82,13 @@ async def handle_message(message: Message):
 
     now = time.time()
     text = message.text
-    lower_text = text.lower()
+    low = text.lower()
 
     if now < mute_until:
         return
 
-    if is_push(lower_text):
+    # если его послали — сдаёт назад и молчит
+    if is_push(low):
         await asyncio.sleep(random.randint(1, 2))
         await message.reply(random.choice(["Ок, торможу.", "Ладно.", "Понял."]))
         mute_until = now + MUTE_SECONDS
@@ -89,21 +96,21 @@ async def handle_message(message: Message):
         return
 
     # если явно позвали
-    if "бот" in lower_text or "@ignathui_bot" in lower_text:
+    if "бот" in low or "@ignathui_bot" in low:
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
         await message.reply(reply)
         active_until = now + ACTIVE_WINDOW
         return
 
-    # если активен — продолжает
+    # если он уже активен — поддерживает разговор
     if now < active_until:
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
         await message.reply(reply)
         return
 
-    # случайное влезание
+    # самовключение
     if random.random() < REPLY_CHANCE:
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
