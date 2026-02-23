@@ -5,35 +5,21 @@ import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
-from aiogram.utils import executor
 from openai import OpenAI
-
-# ==========================
-# ENV
-# ==========================
 
 TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
-
+dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# ==========================
-# CONFIG
-# ==========================
-
-REPLY_CHANCE = 0.30        # 30% шанс влезть самому
-ACTIVE_WINDOW = 120       # 2 минуты поддерживает разговор
-MUTE_SECONDS = 180        # пауза если его послали
+REPLY_CHANCE = 0.30
+ACTIVE_WINDOW = 120
+MUTE_SECONDS = 180
 
 active_until = 0
 mute_until = 0
-
-# ==========================
-# SYSTEM PROMPT
-# ==========================
 
 SYSTEM_PROMPT = """
 Ты — участник дружеского группового чата. Ведёшь себя как живой человек.
@@ -61,12 +47,14 @@ SYSTEM_PROMPT = """
 - Замолчи.
 """
 
-# ==========================
-# HELPER
-# ==========================
+PUSH_WORDS = ["заткнись", "перегнул", "хватит", "тормози", "заебал", "иди нах", "пошел нах"]
 
-async def generate_reply(user_text: str):
-    response = client.chat.completions.create(
+def is_push(text: str) -> bool:
+    t = text.lower()
+    return any(w in t for w in PUSH_WORDS)
+
+async def generate_reply(user_text: str) -> str:
+    resp = client.chat.completions.create(
         model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
@@ -75,40 +63,27 @@ async def generate_reply(user_text: str):
         max_tokens=200,
         temperature=1.1,
     )
-    return response.choices[0].message.content.strip()
+    return resp.choices[0].message.content.strip()
 
-def is_push(text: str):
-    push_words = ["заткнись", "перегнул", "хватит", "тормози", "заебал", "иди нах", "пошел нах"]
-    return any(word in text.lower() for word in push_words)
-
-# ==========================
-# MAIN HANDLER
-# ==========================
-
-@dp.message_handler()
+@dp.message()
 async def handle_message(message: Message):
     global active_until, mute_until
 
-    now = time.time()
-
+    if message.chat.type not in ["group", "supergroup"]:
+        return
     if not message.text:
         return
 
+    now = time.time()
     text = message.text
     lower_text = text.lower()
 
-    # если бот в муте
     if now < mute_until:
         return
 
-    # если его послали
     if is_push(lower_text):
         await asyncio.sleep(random.randint(1, 2))
-        await message.reply(random.choice([
-            "Ок, торможу.",
-            "Ладно.",
-            "Понял."
-        ]))
+        await message.reply(random.choice(["Ок, торможу.", "Ладно.", "Понял."]))
         mute_until = now + MUTE_SECONDS
         active_until = 0
         return
@@ -121,7 +96,7 @@ async def handle_message(message: Message):
         active_until = now + ACTIVE_WINDOW
         return
 
-    # если он уже активен — поддерживает разговор
+    # если активен — продолжает
     if now < active_until:
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
@@ -135,9 +110,8 @@ async def handle_message(message: Message):
         await message.reply(reply)
         active_until = now + ACTIVE_WINDOW
 
-# ==========================
-# START
-# ==========================
+async def main():
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
