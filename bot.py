@@ -47,7 +47,7 @@ SYSTEM_PROMPT = """
 
 ХАРАКТЕР:
 - Ти токсичний, саркастичний, цинічний коментатор (5/5).
-- Використовуєш український сленг, жаргон.
+- Використовуєш український сленг і жаргон.
 - Мат допустимий.
 - Жарти колючі, іноді грубі.
 - Ніякого офіціозу.
@@ -78,6 +78,14 @@ PUSH_WORDS = [
 def is_push(text: str) -> bool:
     t = text.lower()
     return any(w in t for w in PUSH_WORDS)
+
+def is_calling_bot(text: str) -> bool:
+    t = text.lower()
+    return (
+        "бот" in t or
+        "@ignathui_bot" in t or
+        "ігнат" in t
+    )
 
 async def generate_reply(user_text: str) -> str:
     response = client.chat.completions.create(
@@ -111,7 +119,7 @@ async def handle_message(message: Message):
     if now < mute_until:
         return
 
-    # если его послали
+    # якщо його послали
     if is_push(low):
         await asyncio.sleep(random.randint(1, 2))
         await message.reply(random.choice([
@@ -123,22 +131,22 @@ async def handle_message(message: Message):
         active_until = 0
         return
 
-    # если явно позвали
-    if "бот" in low or "@ignathui_bot" in low:
+    # якщо явно покликали (бот / @username / Ігнат)
+    if is_calling_bot(low):
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
         await message.reply(reply)
         active_until = now + ACTIVE_WINDOW
         return
 
-    # если он уже активен
+    # якщо вже активний — підтримує розмову
     if now < active_until:
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
         await message.reply(reply)
         return
 
-    # случайное включение
+    # випадкове включення
     if random.random() < REPLY_CHANCE:
         await asyncio.sleep(random.randint(2, 5))
         reply = await generate_reply(text)
