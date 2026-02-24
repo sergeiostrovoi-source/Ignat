@@ -31,27 +31,28 @@ TZ = ZoneInfo("Europe/Kiev")
 MODEL = "gpt-4.1-mini"
 
 # ==========================
-# BEHAVIOR CONFIG
+# CONFIG
 # ==========================
-CONTEXT_N = 18
+CONTEXT_N = 30
 
-# Troll dialog
-DIALOG_TURNS_MIN = 3
-DIALOG_TURNS_MAX = 5
-EXIT_PROB_PER_TURN = 0.35              # шанс "вийти в закат" після мінімуму
-IGNORE_AFTER_EXIT_SECONDS = 20 * 60    # 20 хв ігнор ПІСЛЯ виходу — тільки для одного юзера
+# Active "in-the-chat" window
+ACTIVE_WINDOW_SECONDS = 60 * 60   # ✅ 1 hour after being called / engaged
 
-# Random interjection
-AUTO_INTERJECT_CHANCE = 0.10           # інколи щось скаже
+# Queue / pacing
+QUEUE_WORKER_EVERY = 2.0
+BATCH_WINDOW_SECONDS = 6.0
+MAX_BATCH_ITEMS = 4
+SEND_COOLDOWN_SECONDS = 6.0       # не чаще 1 ответа раз в ~6 сек на чат
 
-# Conflict
-BOT_COOLDOWN_SECONDS = 18              # антиспам
+# Gentle auto interject (low)
+AUTO_INTERJECT_CHANCE = 0.08
+BOT_COOLDOWN_IN_HANDLER = 0.8     # handler almost never replies; worker does
 
-# Daily ping
+# Daily ping rules
 SILENCE_HOURS_FOR_PING = 18
-PING_WINDOW_START = 10                 # 10:00
-PING_WINDOW_END = 22                   # 22:00
-MORNING_PING_HOUR = 7                  # інколи 07:00
+PING_WINDOW_START = 10
+PING_WINDOW_END = 22
+MORNING_PING_HOUR = 7
 MORNING_PING_PROB = 0.15
 PING_CHECK_EVERY_SECONDS = 60
 
@@ -59,55 +60,98 @@ PING_CHECK_EVERY_SECONDS = 60
 # STATE
 # ==========================
 @dataclass
+class PendingItem:
+    ts: float
+    chat_id: int
+    message_id: int
+    user_id: int
+    user_name: str
+    text: str
+    is_call: bool = False
+    is_conflict: bool = False
+    is_defensive: bool = False
+
+@dataclass
 class ChatState:
     enabled: bool = True
     last_activity_ts: float = 0.0
-    last_bot_ts: float = 0.0
 
-    # ІГНОР ПО КОНКРЕТНИХ ЛЮДЯХ: user_id -> until_ts
-    ignore_users_until: dict[int, float] = field(default_factory=dict)
+    # bot activity
+    active_until_ts: float = 0.0
+    last_sent_ts: float = 0.0
 
-    # діалог троля
-    dialog_active_until_ts: float = 0.0
-    dialog_turns_left: int = 0
-    dialog_partner_user_id: int | None = None
-
-    # облік пінгу
-    last_ping_ts: float = 0.0
-
-    # контекст
+    # context
     memory: deque = field(default_factory=lambda: deque(maxlen=CONTEXT_N))
+
+    # queue
+    queue: deque = field(default_factory=deque)
+
+    # ping
+    last_ping_ts: float = 0.0
 
 chat_states: dict[int, ChatState] = defaultdict(ChatState)
 
 # ==========================
-# LEXICON HEURISTICS
+# HEURISTICS
 # ==========================
+CALL_WORDS = ["ігнат", "арбітр", "суддя", "модер", "модератор", "бот"]
+
+# Мы ловим эскалацию/наезд по действиям и общему тону.
+# (без слуров и без прицельных “ты …” как цель)
 ATTACK_MARKERS = [
-    "дебіл", "ідіот", "йоб", "єбан", "сука", "підар", "пидарас", "підорас",
-    "лох", "клоун", "тупий", "довбойоб", "долбоёб", "мудак", "гівно", "сміття",
-    "заткнись", "завались", "закрий пельку", "відвали", "йди нах", "пішов нах",
-    "здохни", "уб'ю", "вбийся"
+    "заткнись", "завались", "відвали", "йди нах", "пішов нах",
+    "соси", "пішов ти", "та пішов", "нахуй", "нах*й",
+    "хуй", "залуп", "пизд", "пізд", "пизда", "пізда",
+    "сука", "єбан", "йоб", "бля", "бляха",
+    "придур", "ідіот", "дебіл", "клоун"
 ]
 
 DEFENSE_MARKERS = [
     "я не", "ти не так", "шо ти", "чого ти", "та не", "серйозно?", "я взагалі",
-    "поясню", "не треба", "давай без", "спокійно", "ти про шо", "я просто"
+    "поясню", "не треба", "давай без", "спокійно", "ти про шо", "я просто",
+    "ти мене не так", "я не хотів", "не наїжджай"
 ]
 
-CALL_WORDS = ["ігнат", "арбітр", "суддя", "модер", "модератор", "бот"]
+# ==========================
+# PROMPTS
+# ==========================
+MOD_SYSTEM = """
+Ти — дорослий модератор українського групового чату.
 
-EXIT_JABS = [
-    "Ладно, я погнав — у мене справи, не те що в деяких тут 😏",
-    "Все, я зникаю. Робота сама себе не зробить — на відміну від ваших балачок.",
-    "Ок, досить. Мені ще жити це життя, а не сидіти тут 24/7.",
-    "Я пішов. Як звільнюся від справ — може ще підкину вам розуму.",
-]
-EXIT_NEUTRAL = [
-    "Все, я зникаю. Не рознесіть чат без мене.",
-    "Ок, мені час. Тримайтеся тут.",
-    "Погнав далі. Без цирку, ок?",
-]
+Ціль: зупиняти наїзди/ескалацію і тримати рамки.
+
+Правила:
+- ЛИШЕ українською.
+- 1–2 короткі репліки.
+- У конфлікті: нуль жартів/флірту/підйобів.
+- Принцип: РУГАЄШ ДІЮ/ПОВЕДІНКУ, А НЕ ЛЮДИНУ.
+  (тобто: "це хамство/це зайве/не переходь на особисте", а не "ти такий-то".)
+- Вистав межу: "без особистого", "по фактах", "переформулюй".
+- Якщо тон культурний, але хтось явно захищається — коротко: "що сталося?" і поверни на факти.
+
+Заборони:
+- Без слурів/мови ненависті.
+- Без погроз реальної шкоди.
+- Не кажи, що ти бот/ШІ.
+"""
+
+TROLL_SYSTEM = """
+Ти — арбітр з характером у дружньому українському чаті.
+Ти підтримуєш діалог, інколи грубо і з матом, але тримаєш правило:
+РУГАЄШ ДІЮ/ПОВЕДІНКУ, А НЕ ЛЮДИНУ.
+
+Правила:
+- ЛИШЕ українською.
+- 1–2 короткі репліки (інколи 3, якщо треба).
+- Мат дозволений, але без слурів/мови ненависті.
+- Не перетворюйся на флуд: якщо багато людей пишуть — почни з "тихо-тихо" і відповідай по черзі або одним коментом на всіх.
+- Якщо бачиш конфлікт — перемикайся в режим модератора (сухо, по рамкам).
+
+Заборони:
+- Погрози/насильство — ні.
+- Прицільне приниження людини (“ти …”) — ні.
+- Не кажи, що ти бот/ШІ.
+"""
 
 PING_TEXTS = [
     "Куди всі пропали, друзяки? 😄",
@@ -117,13 +161,7 @@ PING_TEXTS = [
 ]
 MORNING_TEXTS = [
     "Доброго ранку, друзяки ☕️",
-    "Доброго ранку. Хто вже в строю?",
     "Ранок. Прокидаємось, легенди 😄",
-]
-TROLL_SEEDS = [
-    "Ну шо, генії, як життя?",
-    "Хто сьогодні головний по здоровому глузду?",
-    "Я бачу, рівень драматургії стабільний.",
 ]
 
 # ==========================
@@ -132,14 +170,11 @@ TROLL_SEEDS = [
 def now_ts() -> float:
     return time.time()
 
-def local_dt(ts: float | None = None) -> datetime:
-    return datetime.fromtimestamp(ts or now_ts(), TZ)
-
 def in_group(chat_type: str) -> bool:
     return chat_type in ("group", "supergroup")
 
-def text_lc(msg: Message) -> str:
-    return (msg.text or "").strip().lower()
+def lc_text(t: str) -> str:
+    return (t or "").strip().lower()
 
 def called_bot(low: str, bot_username: str) -> bool:
     if bot_username and f"@{bot_username.lower()}" in low:
@@ -155,7 +190,7 @@ def looks_like_defense(low: str) -> bool:
 def format_context(chat_id: int) -> str:
     mem = list(chat_states[chat_id].memory)
     lines = []
-    for name, uid, txt in mem[-CONTEXT_N:]:
+    for name, txt in mem[-CONTEXT_N:]:
         if not txt:
             continue
         t = txt.strip()
@@ -178,22 +213,15 @@ def split_short(text: str) -> list[str]:
 
     trimmed = []
     for p in parts:
-        if len(p) > 220:
-            p = p[:220].rstrip() + "…"
+        if len(p) > 240:
+            p = p[:240].rstrip() + "…"
         trimmed.append(p)
 
     r = random.random()
-    limit = 1 if r < 0.65 else 2
+    limit = 1 if r < 0.55 else (2 if r < 0.9 else 3)
     return trimmed[:limit] if trimmed else ["Ок."]
 
-async def is_admin(chat_id: int, user_id: int) -> bool:
-    try:
-        m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in ("administrator", "creator")
-    except TelegramBadRequest:
-        return False
-
-async def llm(system: str, user: str, max_tokens: int = 120) -> str:
+async def llm(system: str, user: str, max_tokens: int = 160) -> str:
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -210,49 +238,12 @@ async def llm(system: str, user: str, max_tokens: int = 120) -> str:
     except Exception:
         return ""
 
-def is_user_ignored(state: ChatState, user_id: int, now: float) -> bool:
-    until = state.ignore_users_until.get(user_id, 0.0)
-    if now < until:
-        return True
-    # подчищаем протухшее
-    if until and now >= until:
-        state.ignore_users_until.pop(user_id, None)
-    return False
-
-# ==========================
-# PROMPTS
-# ==========================
-MOD_SYSTEM = """
-Ти — дорослий модератор українського групового чату. Твоя роль: швидко ставити межі і гасити конфлікти.
-
-Вимоги:
-- ЛИШЕ українською.
-- Коротко (1–2 репліки).
-- Жодних жартів, флірту, підйобів у конфлікті.
-- Якщо тон культурний, але хтось явно захищається — спитай коротко “що сталося?” і запропонуй перейти на факти.
-- Якщо є наїзд/образи — зупини, вистав правило (“без особистого”), запропонуй переформулювати.
-
-Заборони:
-- Не принижуй людину.
-- Не закликай до насильства/шкоди.
-- Не згадуй, що ти бот/ШІ.
-"""
-
-TROLL_SYSTEM = """
-Ти — умний токсичний троль-арбітр українського чату.
-Ти підтримуєш діалог живо, можеш використовувати легкий і жорсткий мат, сленг — але не переходиш у травлю.
-
-Вимоги:
-- ЛИШЕ українською.
-- 1–2 короткі репліки.
-- Дотепно, швидко, по суті.
-- Не розпалюй конфлікт: якщо бачиш, що це сварка — перемикайся в режим модератора (стримано).
-
-Заборони:
-- Мова ненависті/приниження за груповими ознаками — ні.
-- Погрози/насильство — ні.
-- Не кажи, що ти бот/ШІ.
-"""
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("administrator", "creator")
+    except TelegramBadRequest:
+        return False
 
 # ==========================
 # COMMANDS
@@ -272,7 +263,7 @@ async def handle_commands(message: Message, low: str, state: ChatState) -> bool:
     if low.startswith("/on"):
         if await is_admin(chat_id, u.id):
             state.enabled = True
-            await message.reply("Ок, я в строю. Без наїздів — і всі щасливі.")
+            await message.reply("Ок, я в строю.")
         else:
             await message.reply("Тільки адміни можуть мене вмикати.")
         return True
@@ -285,7 +276,7 @@ async def handle_commands(message: Message, low: str, state: ChatState) -> bool:
     return False
 
 # ==========================
-# CORE HANDLER
+# MESSAGE HANDLER (enqueue only)
 # ==========================
 @dp.message()
 async def on_message(message: Message):
@@ -297,126 +288,143 @@ async def on_message(message: Message):
     chat_id = message.chat.id
     state = chat_states[chat_id]
     now = now_ts()
-    low = text_lc(message)
+
+    state.last_activity_ts = now
+
+    text = message.text.strip()
+    low = lc_text(text)
 
     u = message.from_user
     name = (u.full_name or u.username or "Хтось").strip()
 
-    # activity + memory
-    state.last_activity_ts = now
-    state.memory.append((name, u.id, message.text.strip()))
+    # context memory
+    state.memory.append((name, text))
 
-    # commands first
+    # commands
     if await handle_commands(message, low, state):
         return
-
     if not state.enabled:
         return
 
-    # ✅ игнор только этого пользователя
-    if is_user_ignored(state, u.id, now):
-        return
-
-    # anti-spam cooldown
-    if now - state.last_bot_ts < BOT_COOLDOWN_SECONDS:
-        return
+    # handler pacing: worker answers
+    if state.last_sent_ts and (now - state.last_sent_ts) < BOT_COOLDOWN_IN_HANDLER:
+        pass
 
     me = await bot.me()
     bot_username = (me.username or "").strip()
 
-    # 1) Conflict detection
-    attack = looks_like_attack(low)
-    defensive = looks_like_defense(low)
-    is_reply = bool(message.reply_to_message and (message.reply_to_message.text or ""))
+    is_call = called_bot(low, bot_username)
+    is_conflict = looks_like_attack(low)
+    is_def = looks_like_defense(low)
 
-    must_moderate = attack or (defensive and (is_reply or random.random() < 0.55))
+    # activate 1 hour when called / conflict / strong defensive vibe
+    if is_call or is_conflict:
+        state.active_until_ts = max(state.active_until_ts, now + ACTIVE_WINDOW_SECONDS)
 
-    if must_moderate:
-        ctx = format_context(chat_id)
-        prompt = (
-            f"Контекст (останні повідомлення):\n{ctx}\n\n"
-            f"Останнє повідомлення:\n{name}: {message.text}\n\n"
-            "Дай коротке втручання модератора згідно правил."
-        )
-        reply = await llm(MOD_SYSTEM, prompt, max_tokens=110)
-        if reply:
-            for line in split_short(reply):
-                await message.reply(line)
-            state.last_bot_ts = now
-        return
+    in_active = now < state.active_until_ts
+    auto = (not in_active) and (random.random() < AUTO_INTERJECT_CHANCE)
 
-    # 2) Troll dialog mode
-    called = called_bot(low, bot_username)
-    in_dialog = now < state.dialog_active_until_ts and state.dialog_turns_left > 0
-
-    # ограничиваем "партнёром" диалога
-    partner_ok = (state.dialog_partner_user_id is None) or (u.id == state.dialog_partner_user_id) or called
-
-    if called and not in_dialog:
-        state.dialog_turns_left = random.randint(DIALOG_TURNS_MIN, DIALOG_TURNS_MAX)
-        state.dialog_active_until_ts = now + 8 * 60
-        state.dialog_partner_user_id = u.id
-
-    if in_dialog and not partner_ok:
-        return
-
-    if called or in_dialog:
-        ctx = format_context(chat_id)
-        seed = random.choice(TROLL_SEEDS)
-        prompt = (
-            f"{seed}\n\n"
-            f"Контекст:\n{ctx}\n\n"
-            f"Останнє:\n{name}: {message.text}\n\n"
-            "Відповідай як умний токсичний троль-арбітр: коротко, дотепно, українською."
-        )
-        reply = await llm(TROLL_SYSTEM, prompt, max_tokens=120)
-        if reply:
-            for line in split_short(reply):
-                await message.reply(line)
-            state.last_bot_ts = now
-
-        # turns down
-        if state.dialog_turns_left > 0:
-            state.dialog_turns_left -= 1
-
-        # Exit logic
-        min_done = state.dialog_turns_left <= (DIALOG_TURNS_MAX - DIALOG_TURNS_MIN)
-        should_exit = (state.dialog_turns_left <= 0) or (min_done and random.random() < EXIT_PROB_PER_TURN)
-
-        if should_exit:
-            exit_text = random.choice(EXIT_JABS if random.random() < 0.55 else EXIT_NEUTRAL)
-            await asyncio.sleep(random.uniform(0.6, 1.8))
-            await message.reply(exit_text)
-
-            # ✅ игнорим только партнёра диалога (или текущего автора, если партнёр не задан)
-            target_id = state.dialog_partner_user_id or u.id
-            state.ignore_users_until[target_id] = now + IGNORE_AFTER_EXIT_SECONDS
-
-            # reset dialog
-            state.dialog_active_until_ts = 0
-            state.dialog_turns_left = 0
-            state.dialog_partner_user_id = None
-
-            state.last_bot_ts = now_ts()
-
-        return
-
-    # 3) Sometimes interject lightly
-    if random.random() < AUTO_INTERJECT_CHANCE:
-        ctx = format_context(chat_id)
-        prompt = (
-            f"Контекст:\n{ctx}\n\n"
-            f"Останнє:\n{name}: {message.text}\n\n"
-            "Дай коротку, нейтрально-дотепну реакцію або питання українською (1 репліка)."
-        )
-        reply = await llm(TROLL_SYSTEM, prompt, max_tokens=60)
-        if reply:
-            line = split_short(reply)[0]
-            await message.reply(line)
-            state.last_bot_ts = now
+    if is_call or is_conflict or is_def or in_active or auto:
+        state.queue.append(PendingItem(
+            ts=now,
+            chat_id=chat_id,
+            message_id=message.message_id,
+            user_id=u.id,
+            user_name=name,
+            text=text,
+            is_call=is_call,
+            is_conflict=is_conflict,
+            is_defensive=is_def,
+        ))
 
 # ==========================
-# DAILY PING LOOP
+# WORKER: reply with batching and "тихо-тихо"
+# ==========================
+async def chat_worker_loop():
+    while True:
+        await asyncio.sleep(QUEUE_WORKER_EVERY)
+        now = now_ts()
+
+        for chat_id, state in list(chat_states.items()):
+            if not state.enabled:
+                continue
+            if not state.queue:
+                continue
+
+            # send cooldown
+            if state.last_sent_ts and (now - state.last_sent_ts) < SEND_COOLDOWN_SECONDS:
+                continue
+
+            # batch
+            batch = []
+            first_ts = state.queue[0].ts
+            while state.queue and len(batch) < MAX_BATCH_ITEMS:
+                item = state.queue[0]
+                if (item.ts - first_ts) <= BATCH_WINDOW_SECONDS:
+                    batch.append(state.queue.popleft())
+                else:
+                    break
+
+            if not batch:
+                continue
+
+            has_conflict = any(x.is_conflict for x in batch)
+            has_defense = any(x.is_defensive for x in batch)
+            called = any(x.is_call for x in batch)
+
+            ctx = format_context(chat_id)
+
+            unique_users = list({x.user_id for x in batch})
+            many_people = len(unique_users) >= 3
+
+            incoming_lines = []
+            for x in batch:
+                t = x.text
+                if len(t) > 220:
+                    t = t[:220] + "…"
+                incoming_lines.append(f"{x.user_name}: {t}")
+            incoming_block = "\n".join(incoming_lines)
+
+            # choose system
+            if has_conflict:
+                system = MOD_SYSTEM
+                task = "Зупини ескалацію. Ругай дію/поведінку, а не людину."
+            else:
+                system = TROLL_SYSTEM
+                task = "Підтримай діалог. Ругай дію/поведінку, а не людину."
+
+            # guidance for crowd
+            crowd_note = ""
+            if many_people:
+                crowd_note = "Якщо багато людей одночасно — почни з 'тихо-тихо' і відповідай по черзі або одним коментом на всіх.\n"
+
+            prompt = (
+                f"Контекст:\n{ctx}\n\n"
+                f"Останні повідомлення:\n{incoming_block}\n\n"
+                f"{crowd_note}"
+                f"Завдання: {task}"
+            )
+
+            reply = await llm(system, prompt, max_tokens=180)
+            if not reply:
+                continue
+
+            out_lines = split_short(reply)
+
+            # prepend calming line if crowd and not already present
+            if many_people:
+                head = out_lines[0].lower()
+                if "тихо" not in head and "спокій" not in head:
+                    out_lines = ["Тихо-тихо. По черзі."] + out_lines[:2]
+
+            for line in out_lines:
+                await bot.send_message(chat_id, line)
+                await asyncio.sleep(random.uniform(0.4, 1.2))
+
+            state.last_sent_ts = now_ts()
+
+# ==========================
+# PING LOOP
 # ==========================
 def can_ping_now(dt: datetime) -> bool:
     if PING_WINDOW_START <= dt.hour < PING_WINDOW_END:
@@ -428,7 +436,7 @@ def can_ping_now(dt: datetime) -> bool:
 def ping_limit_ok(state: ChatState, now: float) -> bool:
     if state.last_ping_ts <= 0:
         return True
-    return (now - state.last_ping_ts) >= 24 * 60 * 60  # max 1 per 24h
+    return (now - state.last_ping_ts) >= 24 * 60 * 60
 
 async def ping_loop():
     while True:
@@ -453,7 +461,7 @@ async def ping_loop():
             try:
                 await bot.send_message(chat_id, txt)
                 state.last_ping_ts = now
-                state.last_bot_ts = now
+                state.last_sent_ts = now
             except TelegramBadRequest:
                 pass
 
@@ -461,6 +469,7 @@ async def ping_loop():
 # START
 # ==========================
 async def main():
+    asyncio.create_task(chat_worker_loop())
     asyncio.create_task(ping_loop())
     await dp.start_polling(bot)
 
