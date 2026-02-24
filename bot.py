@@ -33,27 +33,26 @@ MODEL = "gpt-4.1-mini"
 # ==========================
 # CONFIG
 # ==========================
-CONTEXT_N = 30
+CONTEXT_N = 45  # больше контекста
 
-# Active "in-the-chat" window
-ACTIVE_WINDOW_SECONDS = 60 * 60   # ✅ 1 hour after being called / engaged
+# 1 час активного режима после вызова/вмешательства
+ACTIVE_WINDOW_SECONDS = 60 * 60
 
-# Queue / pacing
-QUEUE_WORKER_EVERY = 2.0
-BATCH_WINDOW_SECONDS = 6.0
-MAX_BATCH_ITEMS = 4
-SEND_COOLDOWN_SECONDS = 6.0       # не чаще 1 ответа раз в ~6 сек на чат
+# Очередь и батчинг
+QUEUE_WORKER_EVERY = 1.5
+BATCH_WINDOW_SECONDS = 7.0
+MAX_BATCH_ITEMS = 6
+SEND_COOLDOWN_SECONDS = 5.5  # быстрее реагирует, но не флудит
 
-# Gentle auto interject (low)
-AUTO_INTERJECT_CHANCE = 0.08
-BOT_COOLDOWN_IN_HANDLER = 0.8     # handler almost never replies; worker does
+# Самовключение (редко)
+AUTO_INTERJECT_CHANCE = 0.10
 
-# Daily ping rules
+# Daily ping
 SILENCE_HOURS_FOR_PING = 18
 PING_WINDOW_START = 10
 PING_WINDOW_END = 22
 MORNING_PING_HOUR = 7
-MORNING_PING_PROB = 0.15
+MORNING_PING_PROB = 0.18
 PING_CHECK_EVERY_SECONDS = 60
 
 # ==========================
@@ -63,7 +62,6 @@ PING_CHECK_EVERY_SECONDS = 60
 class PendingItem:
     ts: float
     chat_id: int
-    message_id: int
     user_id: int
     user_name: str
     text: str
@@ -76,17 +74,12 @@ class ChatState:
     enabled: bool = True
     last_activity_ts: float = 0.0
 
-    # bot activity
     active_until_ts: float = 0.0
     last_sent_ts: float = 0.0
 
-    # context
     memory: deque = field(default_factory=lambda: deque(maxlen=CONTEXT_N))
-
-    # queue
     queue: deque = field(default_factory=deque)
 
-    # ping
     last_ping_ts: float = 0.0
 
 chat_states: dict[int, ChatState] = defaultdict(ChatState)
@@ -96,62 +89,20 @@ chat_states: dict[int, ChatState] = defaultdict(ChatState)
 # ==========================
 CALL_WORDS = ["ігнат", "арбітр", "суддя", "модер", "модератор", "бот"]
 
-# Мы ловим эскалацию/наезд по действиям и общему тону.
-# (без слуров и без прицельных “ты …” как цель)
+# Триггеры эскалации/агрессии (без слуров)
 ATTACK_MARKERS = [
     "заткнись", "завались", "відвали", "йди нах", "пішов нах",
-    "соси", "пішов ти", "та пішов", "нахуй", "нах*й",
+    "соси", "нахуй", "нах*й",
     "хуй", "залуп", "пизд", "пізд", "пизда", "пізда",
     "сука", "єбан", "йоб", "бля", "бляха",
-    "придур", "ідіот", "дебіл", "клоун"
+    "придур", "ідіот", "дебіл", "клоун", "мудак", "лох"
 ]
 
 DEFENSE_MARKERS = [
     "я не", "ти не так", "шо ти", "чого ти", "та не", "серйозно?", "я взагалі",
     "поясню", "не треба", "давай без", "спокійно", "ти про шо", "я просто",
-    "ти мене не так", "я не хотів", "не наїжджай"
+    "не наїжджай", "перестань", "досить", "чого ти до мене"
 ]
-
-# ==========================
-# PROMPTS
-# ==========================
-MOD_SYSTEM = """
-Ти — дорослий модератор українського групового чату.
-
-Ціль: зупиняти наїзди/ескалацію і тримати рамки.
-
-Правила:
-- ЛИШЕ українською.
-- 1–2 короткі репліки.
-- У конфлікті: нуль жартів/флірту/підйобів.
-- Принцип: РУГАЄШ ДІЮ/ПОВЕДІНКУ, А НЕ ЛЮДИНУ.
-  (тобто: "це хамство/це зайве/не переходь на особисте", а не "ти такий-то".)
-- Вистав межу: "без особистого", "по фактах", "переформулюй".
-- Якщо тон культурний, але хтось явно захищається — коротко: "що сталося?" і поверни на факти.
-
-Заборони:
-- Без слурів/мови ненависті.
-- Без погроз реальної шкоди.
-- Не кажи, що ти бот/ШІ.
-"""
-
-TROLL_SYSTEM = """
-Ти — арбітр з характером у дружньому українському чаті.
-Ти підтримуєш діалог, інколи грубо і з матом, але тримаєш правило:
-РУГАЄШ ДІЮ/ПОВЕДІНКУ, А НЕ ЛЮДИНУ.
-
-Правила:
-- ЛИШЕ українською.
-- 1–2 короткі репліки (інколи 3, якщо треба).
-- Мат дозволений, але без слурів/мови ненависті.
-- Не перетворюйся на флуд: якщо багато людей пишуть — почни з "тихо-тихо" і відповідай по черзі або одним коментом на всіх.
-- Якщо бачиш конфлікт — перемикайся в режим модератора (сухо, по рамкам).
-
-Заборони:
-- Погрози/насильство — ні.
-- Прицільне приниження людини (“ти …”) — ні.
-- Не кажи, що ти бот/ШІ.
-"""
 
 PING_TEXTS = [
     "Куди всі пропали, друзяки? 😄",
@@ -163,6 +114,47 @@ MORNING_TEXTS = [
     "Доброго ранку, друзяки ☕️",
     "Ранок. Прокидаємось, легенди 😄",
 ]
+
+# ==========================
+# PROMPTS (максимально жёстко, но без слуров/ненависти)
+# ==========================
+MOD_SYSTEM = """
+Ти — жорсткий дорослий арбітр українського групового чату. Ти різкий і неприємний, але тримаєш рамки.
+
+Ціль: зупиняти ескалацію і наїзди, ставити правила.
+
+Правила:
+- ЛИШЕ українською.
+- Коротко: 1–2 репліки (інколи 3, якщо треба розвести натовп).
+- Мат дозволений.
+- Принцип: частіше ругай ДІЮ/ПОВЕДІНКУ, але інколи можеш жорстко бити по статусу в моменті
+  ("виглядаєш жалюгідно", "це слабко", "логіка кульгає", "спроба домінувати — нуль"),
+  НЕ використовуючи слури/мову ненависті.
+- У конфлікті — нуль жартів/флірту. Сухо і владно.
+
+Заборони:
+- Без слурів/мови ненависті.
+- Без погроз реальної шкоди.
+- Не кажи, що ти бот/ШІ.
+"""
+
+TROLL_SYSTEM = """
+Ти — максимально жорсткий арбітр-троль українського чату.
+Ти підтримуєш діалог, відповідаєш швидко, грубо, з матом, але не скочуєшся в мову ненависті.
+
+Правила:
+- ЛИШЕ українською.
+- 1–2 короткі репліки (інколи 3).
+- Мат можна вільно (типу: хуй, залупа, пізда, хуй моржовий і т.п.), але без слурів/мови ненависті.
+- Частіше ругай ДІЮ/ПОВЕДІНКУ. Іноді — по статусу в моменті ("це слабко", "виглядаєш жалюгідно", "аргумент нуль").
+- Якщо багато людей пишуть одночасно — спочатку "Тихо-тихо.", потім відповідай по черзі або одним коментом на всіх.
+- Якщо бачиш, що це конфлікт — перемикайся в сухий MOD-режим.
+
+Заборони:
+- Погрози/насильство — ні.
+- Слури/мова ненависті — ні.
+- Не кажи, що ти бот/ШІ.
+"""
 
 # ==========================
 # HELPERS
@@ -194,8 +186,8 @@ def format_context(chat_id: int) -> str:
         if not txt:
             continue
         t = txt.strip()
-        if len(t) > 260:
-            t = t[:260] + "…"
+        if len(t) > 280:
+            t = t[:280] + "…"
         lines.append(f"{name}: {t}")
     return "\n".join(lines)
 
@@ -213,15 +205,15 @@ def split_short(text: str) -> list[str]:
 
     trimmed = []
     for p in parts:
-        if len(p) > 240:
-            p = p[:240].rstrip() + "…"
+        if len(p) > 260:
+            p = p[:260].rstrip() + "…"
         trimmed.append(p)
 
     r = random.random()
-    limit = 1 if r < 0.55 else (2 if r < 0.9 else 3)
+    limit = 1 if r < 0.45 else (2 if r < 0.88 else 3)
     return trimmed[:limit] if trimmed else ["Ок."]
 
-async def llm(system: str, user: str, max_tokens: int = 160) -> str:
+async def llm(system: str, user: str, max_tokens: int = 200) -> str:
     try:
         resp = client.chat.completions.create(
             model=MODEL,
@@ -229,10 +221,10 @@ async def llm(system: str, user: str, max_tokens: int = 160) -> str:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=1.05,
+            temperature=1.07,
             max_tokens=max_tokens,
-            presence_penalty=0.6,
-            frequency_penalty=0.4,
+            presence_penalty=0.65,
+            frequency_penalty=0.45,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
@@ -288,7 +280,6 @@ async def on_message(message: Message):
     chat_id = message.chat.id
     state = chat_states[chat_id]
     now = now_ts()
-
     state.last_activity_ts = now
 
     text = message.text.strip()
@@ -297,7 +288,7 @@ async def on_message(message: Message):
     u = message.from_user
     name = (u.full_name or u.username or "Хтось").strip()
 
-    # context memory
+    # memory
     state.memory.append((name, text))
 
     # commands
@@ -306,10 +297,6 @@ async def on_message(message: Message):
     if not state.enabled:
         return
 
-    # handler pacing: worker answers
-    if state.last_sent_ts and (now - state.last_sent_ts) < BOT_COOLDOWN_IN_HANDLER:
-        pass
-
     me = await bot.me()
     bot_username = (me.username or "").strip()
 
@@ -317,18 +304,18 @@ async def on_message(message: Message):
     is_conflict = looks_like_attack(low)
     is_def = looks_like_defense(low)
 
-    # activate 1 hour when called / conflict / strong defensive vibe
-    if is_call or is_conflict:
+    # activate window
+    if is_call or is_conflict or is_def:
         state.active_until_ts = max(state.active_until_ts, now + ACTIVE_WINDOW_SECONDS)
 
     in_active = now < state.active_until_ts
     auto = (not in_active) and (random.random() < AUTO_INTERJECT_CHANCE)
 
+    # enqueue if relevant
     if is_call or is_conflict or is_def or in_active or auto:
         state.queue.append(PendingItem(
             ts=now,
             chat_id=chat_id,
-            message_id=message.message_id,
             user_id=u.id,
             user_name=name,
             text=text,
@@ -338,7 +325,7 @@ async def on_message(message: Message):
         ))
 
 # ==========================
-# WORKER: reply with batching and "тихо-тихо"
+# WORKER: batching + crowd control
 # ==========================
 async def chat_worker_loop():
     while True:
@@ -346,12 +333,9 @@ async def chat_worker_loop():
         now = now_ts()
 
         for chat_id, state in list(chat_states.items()):
-            if not state.enabled:
-                continue
-            if not state.queue:
+            if not state.enabled or not state.queue:
                 continue
 
-            # send cooldown
             if state.last_sent_ts and (now - state.last_sent_ts) < SEND_COOLDOWN_SECONDS:
                 continue
 
@@ -369,49 +353,42 @@ async def chat_worker_loop():
                 continue
 
             has_conflict = any(x.is_conflict for x in batch)
-            has_defense = any(x.is_defensive for x in batch)
-            called = any(x.is_call for x in batch)
+            # Если защитный вайб без явного мата/наезда — модераторский вопрос "шо сталося?"
+            has_def = any(x.is_defensive for x in batch)
+
+            # crowd?
+            uniq_users = {x.user_id for x in batch}
+            many_people = len(uniq_users) >= 3
 
             ctx = format_context(chat_id)
-
-            unique_users = list({x.user_id for x in batch})
-            many_people = len(unique_users) >= 3
-
             incoming_lines = []
             for x in batch:
                 t = x.text
-                if len(t) > 220:
-                    t = t[:220] + "…"
+                if len(t) > 240:
+                    t = t[:240] + "…"
                 incoming_lines.append(f"{x.user_name}: {t}")
             incoming_block = "\n".join(incoming_lines)
 
-            # choose system
-            if has_conflict:
-                system = MOD_SYSTEM
-                task = "Зупини ескалацію. Ругай дію/поведінку, а не людину."
-            else:
-                system = TROLL_SYSTEM
-                task = "Підтримай діалог. Ругай дію/поведінку, а не людину."
+            # choose mode
+            system = MOD_SYSTEM if (has_conflict or (has_def and random.random() < 0.55)) else TROLL_SYSTEM
 
-            # guidance for crowd
             crowd_note = ""
             if many_people:
-                crowd_note = "Якщо багато людей одночасно — почни з 'тихо-тихо' і відповідай по черзі або одним коментом на всіх.\n"
+                crowd_note = "Багато людей одночасно. Почни з 'Тихо-тихо.' і відповідай по черзі або одним коментом на всіх.\n"
 
             prompt = (
-                f"Контекст:\n{ctx}\n\n"
-                f"Останні повідомлення:\n{incoming_block}\n\n"
+                f"Контекст (останні репліки):\n{ctx}\n\n"
+                f"Нові репліки:\n{incoming_block}\n\n"
                 f"{crowd_note}"
-                f"Завдання: {task}"
+                f"Відповідай у вибраному стилі, коротко."
             )
 
-            reply = await llm(system, prompt, max_tokens=180)
+            reply = await llm(system, prompt, max_tokens=210)
             if not reply:
                 continue
 
             out_lines = split_short(reply)
 
-            # prepend calming line if crowd and not already present
             if many_people:
                 head = out_lines[0].lower()
                 if "тихо" not in head and "спокій" not in head:
@@ -419,7 +396,7 @@ async def chat_worker_loop():
 
             for line in out_lines:
                 await bot.send_message(chat_id, line)
-                await asyncio.sleep(random.uniform(0.4, 1.2))
+                await asyncio.sleep(random.uniform(0.35, 1.1))
 
             state.last_sent_ts = now_ts()
 
@@ -453,7 +430,7 @@ async def ping_loop():
             if not ping_limit_ok(state, now):
                 continue
 
-            silence = now - (state.last_activity_ts or 0)
+            silence = now - (state.last_activity_ts or 0.0)
             if silence < SILENCE_HOURS_FOR_PING * 3600:
                 continue
 
