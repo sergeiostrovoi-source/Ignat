@@ -2,9 +2,9 @@ import os
 import random
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
@@ -38,23 +38,22 @@ CONTEXT_N = 18
 # Troll dialog
 DIALOG_TURNS_MIN = 3
 DIALOG_TURNS_MAX = 5
-EXIT_PROB_PER_TURN = 0.35              # шанс "вийти в закат" на кожній репліці після мінімуму
-IGNORE_AFTER_EXIT_SECONDS = 20 * 60    # 20 хв ігнор після "закату"
+EXIT_PROB_PER_TURN = 0.35              # шанс "вийти в закат" після мінімуму
+IGNORE_AFTER_EXIT_SECONDS = 20 * 60    # 20 хв ігнор ПІСЛЯ виходу — тільки для одного юзера
 
 # Random interjection
-AUTO_INTERJECT_CHANCE = 0.10           # інколи щось скаже, але не задовбує
+AUTO_INTERJECT_CHANCE = 0.10           # інколи щось скаже
 
 # Conflict
-BOT_COOLDOWN_SECONDS = 18              # антиспам (не частіше ніж раз на ~18 сек)
+BOT_COOLDOWN_SECONDS = 18              # антиспам
 
 # Daily ping
 SILENCE_HOURS_FOR_PING = 18
 PING_WINDOW_START = 10                 # 10:00
 PING_WINDOW_END = 22                   # 22:00
 MORNING_PING_HOUR = 7                  # інколи 07:00
-MORNING_PING_PROB = 0.15               # шанс ранкового пінгу, якщо тиша й умови
+MORNING_PING_PROB = 0.15
 PING_CHECK_EVERY_SECONDS = 60
-MAX_PINGS_PER_24H = 1
 
 # ==========================
 # STATE
@@ -65,27 +64,25 @@ class ChatState:
     last_activity_ts: float = 0.0
     last_bot_ts: float = 0.0
 
-    # "закат" ігнор
-    ignore_until_ts: float = 0.0
+    # ІГНОР ПО КОНКРЕТНИХ ЛЮДЯХ: user_id -> until_ts
+    ignore_users_until: dict[int, float] = field(default_factory=dict)
 
     # діалог троля
     dialog_active_until_ts: float = 0.0
     dialog_turns_left: int = 0
     dialog_partner_user_id: int | None = None
 
-    # облік пінгів
+    # облік пінгу
     last_ping_ts: float = 0.0
 
     # контекст
-    memory: deque = None  # will init per chat
+    memory: deque = field(default_factory=lambda: deque(maxlen=CONTEXT_N))
 
-chat_states: dict[int, ChatState] = defaultdict(lambda: ChatState(memory=deque(maxlen=CONTEXT_N)))
+chat_states: dict[int, ChatState] = defaultdict(ChatState)
 
 # ==========================
 # LEXICON HEURISTICS
 # ==========================
-
-# Явні образи/наїзди (для модератора)
 ATTACK_MARKERS = [
     "дебіл", "ідіот", "йоб", "єбан", "сука", "підар", "пидарас", "підорас",
     "лох", "клоун", "тупий", "довбойоб", "долбоёб", "мудак", "гівно", "сміття",
@@ -93,13 +90,11 @@ ATTACK_MARKERS = [
     "здохни", "уб'ю", "вбийся"
 ]
 
-# Ознаки “хтось захищається/виправдовується” (для м’якого втручання)
 DEFENSE_MARKERS = [
     "я не", "ти не так", "шо ти", "чого ти", "та не", "серйозно?", "я взагалі",
     "поясню", "не треба", "давай без", "спокійно", "ти про шо", "я просто"
 ]
 
-# Звернення до бота
 CALL_WORDS = ["ігнат", "арбітр", "суддя", "модер", "модератор", "бот"]
 
 EXIT_JABS = [
@@ -108,7 +103,6 @@ EXIT_JABS = [
     "Ок, досить. Мені ще жити це життя, а не сидіти тут 24/7.",
     "Я пішов. Як звільнюся від справ — може ще підкину вам розуму.",
 ]
-
 EXIT_NEUTRAL = [
     "Все, я зникаю. Не рознесіть чат без мене.",
     "Ок, мені час. Тримайтеся тут.",
@@ -121,13 +115,11 @@ PING_TEXTS = [
     "Тиша така, що аж підозріло. Хто на зв’язку?",
     "Я щось скучив. Розкажіть, що нового?",
 ]
-
 MORNING_TEXTS = [
     "Доброго ранку, друзяки ☕️",
     "Доброго ранку. Хто вже в строю?",
     "Ранок. Прокидаємось, легенди 😄",
 ]
-
 TROLL_SEEDS = [
     "Ну шо, генії, як життя?",
     "Хто сьогодні головний по здоровому глузду?",
@@ -178,14 +170,12 @@ def split_short(text: str) -> list[str]:
         return ["Ок."]
 
     parts = [p.strip() for p in raw.split("\n") if p.strip()]
-
     if len(parts) == 1:
         tmp = raw
         for sep in ["! ", "? ", ". ", "… "]:
             tmp = tmp.replace(sep, sep.strip() + "\n")
         parts = [p.strip() for p in tmp.split("\n") if p.strip()]
 
-    # limit chars and variability
     trimmed = []
     for p in parts:
         if len(p) > 220:
@@ -218,8 +208,16 @@ async def llm(system: str, user: str, max_tokens: int = 120) -> str:
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
-        # тихий фейл: без крашу сервісу
         return ""
+
+def is_user_ignored(state: ChatState, user_id: int, now: float) -> bool:
+    until = state.ignore_users_until.get(user_id, 0.0)
+    if now < until:
+        return True
+    # подчищаем протухшее
+    if until and now >= until:
+        state.ignore_users_until.pop(user_id, None)
+    return False
 
 # ==========================
 # PROMPTS
@@ -301,10 +299,11 @@ async def on_message(message: Message):
     now = now_ts()
     low = text_lc(message)
 
-    # activity + memory
-    state.last_activity_ts = now
     u = message.from_user
     name = (u.full_name or u.username or "Хтось").strip()
+
+    # activity + memory
+    state.last_activity_ts = now
     state.memory.append((name, u.id, message.text.strip()))
 
     # commands first
@@ -314,25 +313,22 @@ async def on_message(message: Message):
     if not state.enabled:
         return
 
-    # ignore window after "закат"
-    if now < state.ignore_until_ts:
+    # ✅ игнор только этого пользователя
+    if is_user_ignored(state, u.id, now):
         return
 
-    # global cooldown
+    # anti-spam cooldown
     if now - state.last_bot_ts < BOT_COOLDOWN_SECONDS:
         return
 
     me = await bot.me()
     bot_username = (me.username or "").strip()
 
-    # 1) Detect conflict / not-ok vibes:
+    # 1) Conflict detection
     attack = looks_like_attack(low)
-
-    # "cultural but defensive": if reply-thread OR back-and-forth + defense markers
     defensive = looks_like_defense(low)
     is_reply = bool(message.reply_to_message and (message.reply_to_message.text or ""))
 
-    # choose mode
     must_moderate = attack or (defensive and (is_reply or random.random() < 0.55))
 
     if must_moderate:
@@ -349,20 +345,19 @@ async def on_message(message: Message):
             state.last_bot_ts = now
         return
 
-    # 2) Troll dialog mode if called or already in dialog:
+    # 2) Troll dialog mode
     called = called_bot(low, bot_username)
-
     in_dialog = now < state.dialog_active_until_ts and state.dialog_turns_left > 0
+
+    # ограничиваем "партнёром" диалога
     partner_ok = (state.dialog_partner_user_id is None) or (u.id == state.dialog_partner_user_id) or called
 
     if called and not in_dialog:
-        # start dialog
         state.dialog_turns_left = random.randint(DIALOG_TURNS_MIN, DIALOG_TURNS_MAX)
-        state.dialog_active_until_ts = now + 8 * 60  # діалог “живий” до 8 хв
+        state.dialog_active_until_ts = now + 8 * 60
         state.dialog_partner_user_id = u.id
 
     if in_dialog and not partner_ok:
-        # не відповідаємо всім підряд, щоб не з’їхати з теми
         return
 
     if called or in_dialog:
@@ -380,22 +375,22 @@ async def on_message(message: Message):
                 await message.reply(line)
             state.last_bot_ts = now
 
-        # decrement turns and maybe exit "в закат"
+        # turns down
         if state.dialog_turns_left > 0:
             state.dialog_turns_left -= 1
 
-        # Exit logic: random after minimum turns
+        # Exit logic
         min_done = state.dialog_turns_left <= (DIALOG_TURNS_MAX - DIALOG_TURNS_MIN)
         should_exit = (state.dialog_turns_left <= 0) or (min_done and random.random() < EXIT_PROB_PER_TURN)
 
         if should_exit:
-            # exit with jab randomly
             exit_text = random.choice(EXIT_JABS if random.random() < 0.55 else EXIT_NEUTRAL)
             await asyncio.sleep(random.uniform(0.6, 1.8))
             await message.reply(exit_text)
 
-            # ignore for 20 min
-            state.ignore_until_ts = now + IGNORE_AFTER_EXIT_SECONDS
+            # ✅ игнорим только партнёра диалога (или текущего автора, если партнёр не задан)
+            target_id = state.dialog_partner_user_id or u.id
+            state.ignore_users_until[target_id] = now + IGNORE_AFTER_EXIT_SECONDS
 
             # reset dialog
             state.dialog_active_until_ts = 0
@@ -406,7 +401,7 @@ async def on_message(message: Message):
 
         return
 
-    # 3) Sometimes interject lightly (not conflict)
+    # 3) Sometimes interject lightly
     if random.random() < AUTO_INTERJECT_CHANCE:
         ctx = format_context(chat_id)
         prompt = (
@@ -416,7 +411,6 @@ async def on_message(message: Message):
         )
         reply = await llm(TROLL_SYSTEM, prompt, max_tokens=60)
         if reply:
-            # one-liner
             line = split_short(reply)[0]
             await message.reply(line)
             state.last_bot_ts = now
@@ -425,10 +419,8 @@ async def on_message(message: Message):
 # DAILY PING LOOP
 # ==========================
 def can_ping_now(dt: datetime) -> bool:
-    # main window 10-22
     if PING_WINDOW_START <= dt.hour < PING_WINDOW_END:
         return True
-    # rare 07:00 “good morning”
     if dt.hour == MORNING_PING_HOUR and random.random() < MORNING_PING_PROB:
         return True
     return False
@@ -442,15 +434,13 @@ async def ping_loop():
     while True:
         await asyncio.sleep(PING_CHECK_EVERY_SECONDS)
         now = now_ts()
-        dt = local_dt(now)
+        dt = datetime.fromtimestamp(now, TZ)
 
         if not can_ping_now(dt):
             continue
 
         for chat_id, state in list(chat_states.items()):
             if not state.enabled:
-                continue
-            if now < state.ignore_until_ts:
                 continue
             if not ping_limit_ok(state, now):
                 continue
@@ -459,13 +449,7 @@ async def ping_loop():
             if silence < SILENCE_HOURS_FOR_PING * 3600:
                 continue
 
-            # guaranteed ping (once per day) when silence >= 18h
-            txt = None
-            if dt.hour == MORNING_PING_HOUR:
-                txt = random.choice(MORNING_TEXTS)
-            else:
-                txt = random.choice(PING_TEXTS)
-
+            txt = random.choice(MORNING_TEXTS) if dt.hour == MORNING_PING_HOUR else random.choice(PING_TEXTS)
             try:
                 await bot.send_message(chat_id, txt)
                 state.last_ping_ts = now
