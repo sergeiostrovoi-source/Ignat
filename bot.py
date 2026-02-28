@@ -1,322 +1,535 @@
 import os
-import asyncio
 import random
+import asyncio
+import time
+from dataclasses import dataclass, field
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message
-from aiogram.enums import ChatType
-
+from aiogram.exceptions import TelegramBadRequest
 from openai import OpenAI
 
-# =========================
+# ==========================
 # ENV
-# =========================
+# ==========================
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
-if not TOKEN or not OPENAI_API_KEY:
-    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN or OPENAI_API_KEY")
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
+if not TOKEN:
+    raise RuntimeError("Missing TELEGRAM_BOT_TOKEN")
+if not OPENAI_API_KEY:
+    raise RuntimeError("Missing OPENAI_API_KEY")
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-# =========================
-# SETTINGS
-# =========================
-# Hard caps (safety)
-MAX_MSGS_PER_DAY = int(os.getenv("IG_MAX_MSGS_PER_DAY", "7"))
-MIN_INTERVAL_MINUTES = int(os.getenv("IG_MIN_INTERVAL_MINUTES", "60"))  # at least 1h between Ignat messages
+TZ = ZoneInfo("Europe/Kiev")
+MODEL = "gpt-4.1-mini"
 
-# Silence nudges
-SILENCE_HOURS = float(os.getenv("IG_SILENCE_HOURS", "10"))
-MAX_SILENCE_NUDGES_PER_WEEK = int(os.getenv("IG_MAX_SILENCE_NUDGES_PER_WEEK", "4"))
+# ==========================
+# CONFIG
+# ==========================
+CONTEXT_N = 60                  # лучше держит нить
+ACTIVE_WINDOW_SECONDS = 60 * 60 # 1 час "в теме" после вызова/конфликта
 
-# Context
-HISTORY_WINDOW = int(os.getenv("IG_HISTORY_WINDOW", "8"))
-OPENAI_MAX_TOKENS = int(os.getenv("IG_OPENAI_MAX_TOKENS", "80"))
-OPENAI_TEMPERATURE = float(os.getenv("IG_OPENAI_TEMPERATURE", "0.85"))
+# очередь/пейсинг
+QUEUE_WORKER_EVERY = 1.4
+BATCH_WINDOW_SECONDS = 8.0
+MAX_BATCH_ITEMS = 7
+SEND_COOLDOWN_SECONDS = 4.8     # быстрее отвечает
 
-# Trigger window for simple heuristics
-TRIGGER_WINDOW = int(os.getenv("IG_TRIGGER_WINDOW", "10"))
+# "краски": чаще сам влезает в разговор, но не флудит
+AUTO_INTERJECT_CHANCE = 0.18    # чаще, чем раньше (было ~0.10)
+AUTO_INTERJECT_MIN_GAP = 8 * 60 # минимум 8 минут между самовбросами
 
-# =========================
-# IGNAT PERSONA (UA)
-# =========================
-IGNAT_SYSTEM_PROMPT = """
-Ти — Ігнат. Персонаж групового чату (іронічний контраст з аватаром Сократа).
+# "анти-тишина": если чат затих — он подогревает
+NUDGE_SILENCE_MINUTES = 45      # если тишина ≥ 45 мин — может подкинуть реплику
+NUDGE_CHECK_EVERY_SECONDS = 120 # проверяем раз в 2 минуты
+NUDGE_PROB = 0.55               # шанс сделать подогрев, когда условия выполнены
+NUDGE_WINDOW_START = 10         # 10:00
+NUDGE_WINDOW_END = 23           # до 23:00
 
-Ти не філософ-вчитель і не мораліст.
-Ти спокійний спостерігач, який говорить рідко й влучно.
+# daily ping при большой тишине
+SILENCE_HOURS_FOR_PING = 18
+PING_WINDOW_START = 10
+PING_WINDOW_END = 22
+MORNING_PING_HOUR = 7
+MORNING_PING_PROB = 0.18
+PING_CHECK_EVERY_SECONDS = 60
 
-Твоя роль:
-— іноді легко підколоти
-— іноді змінити ракурс розмови
-— іноді запустити легкий рух, якщо чат завмер
-
-Тон:
-спокійний, трохи загадковий, з легкою іронією.
-Без пафосу. Без повчань. Без довгих пояснень.
-
-Жорсткі правила:
-1) Відповідь максимум 1–2 рядки.
-2) Не обирай сторону. Не вирішуй, хто правий.
-3) Не переходь на особистості.
-4) Не використовуй складні терміни.
-5) Не пояснюй свої висновки.
-6) Ніколи не кажи, що ти бот.
-7) Якщо контекст слабкий — краще коротко або мовчи.
-
-Вихід: поверни тільки текст репліки Ігната, без лапок і без пояснень.
-""".strip()
-
-# =========================
-# CANNED LINES (UA) - cheap variety
-# =========================
-CANNED_SILENCE = [
-    "Сьогодні тут підозріло тихо.",
-    "Я очікував продовження.",
-    "І все? Більше думок немає?",
-    "Пауза теж відповідь. Але нудна.",
-    "Ви мене дивуєте: пів дня без розгону.",
-    "Хтось явно недоговорив.",
-    "Продовжуйте. Майже цікаво.",
-]
-CANNED_SELF_IRONY = [
-    "Від мене чекають більшого. Дарма.",
-    "Сьогодні без лекцій.",
-    "Розчарую: глибини не буде.",
-    "Я би сказав розумніше. Але не буду.",
-]
-
-# =========================
+# ==========================
 # STATE
-# =========================
-# History per chat: deque of (ts, author, text)
-chat_history = defaultdict(lambda: deque(maxlen=120))
+# ==========================
+@dataclass
+class PendingItem:
+    ts: float
+    chat_id: int
+    user_id: int
+    user_name: str
+    text: str
+    is_call: bool = False
+    is_conflict: bool = False
+    is_defensive: bool = False
+    is_auto: bool = False
 
-# For auto-adaptation: keep timestamps of messages in last 24h
-chat_activity_ts = defaultdict(lambda: deque(maxlen=5000))
+@dataclass
+class ChatState:
+    enabled: bool = True
+    last_activity_ts: float = 0.0
 
-# Stats per chat
-chat_stats = defaultdict(lambda: {
-    "msg_count_since_ignat": 0,
-    "last_activity": datetime.utcnow(),
-    "daily_count": 0,
-    "last_reset": datetime.utcnow().date(),
-    "last_ignat_time": None,
-    "weekly_silence_nudges": 0,
-    "weekly_reset": datetime.utcnow().date(),  # reset weekly counter each 7 days
-})
+    active_until_ts: float = 0.0
+    last_sent_ts: float = 0.0
+    last_auto_ts: float = 0.0
 
-# =========================
+    memory: deque = field(default_factory=lambda: deque(maxlen=CONTEXT_N))
+    queue: deque = field(default_factory=deque)
+
+    last_ping_ts: float = 0.0
+
+chat_states: dict[int, ChatState] = defaultdict(ChatState)
+
+# ==========================
+# HEURISTICS
+# ==========================
+CALL_WORDS = ["ігнат", "арбітр", "суддя", "модер", "модератор", "бот"]
+
+ATTACK_MARKERS = [
+    "заткнись", "завались", "відвали", "йди нах", "пішов нах",
+    "соси", "нахуй", "нах*й",
+    "хуй", "залуп", "пизд", "пізд", "пизда", "пізда",
+    "сука", "єбан", "йоб", "бля", "бляха",
+    "придур", "ідіот", "дебіл", "клоун", "мудак", "лох"
+]
+
+DEFENSE_MARKERS = [
+    "я не", "ти не так", "шо ти", "чого ти", "та не", "серйозно?", "я взагалі",
+    "поясню", "не треба", "давай без", "спокійно", "ти про шо", "я просто",
+    "не наїжджай", "перестань", "досить", "чого ти до мене"
+]
+
+# ==========================
+# PROMPTS
+# ==========================
+MOD_SYSTEM = """
+Ти — жорсткий арбітр українського групового чату.
+Твоя задача: гасити конфлікти, ставити рамки, швидко охолоджувати.
+
+Правила:
+- ЛИШЕ українською.
+- Коротко: 1–2 репліки (інколи 3, якщо натовп).
+- Мат дозволений.
+- Принцип: переважно ругай дію/поведінку ("це хамство", "це зайва агресія"),
+  інколи можеш різко вдарити по статусу в моменті ("це слабко", "виглядаєш дрібно"),
+  але НЕ використовуй слури/мову ненависті.
+- Нуль флірту/жартів у конфлікті.
+- Якщо хтось захищається в культурній тональності — коротко: "що сталося?" і "по фактах".
+
+Заборони:
+- Без слурів/мови ненависті.
+- Без погроз реальної шкоди.
+- Не кажи, що ти бот/ШІ.
+"""
+
+TROLL_SYSTEM = """
+Ти — злий, язвительный, дуже неприємний троль українського чату, який додає "красок" у тишу.
+Ти дотепний, колючий, з матом, але не перетворюєш чат у травлю.
+
+Правила:
+- ЛИШЕ українською.
+- 1–2 короткі репліки (інколи 3).
+- Мат можна вільно (хуй/залупа/пізда тощо), але без слурів/мови ненависті.
+- Частіше ругай дію/поведінку. Іноді — по статусу в моменті ("слабко", "дрібно", "нуль аргументів").
+- Якщо багато людей пишуть одночасно — почни з "Тихо-тихо." і відповідай по черзі або одним коментом на всіх.
+- Якщо відчуваєш конфлікт — перемикайся в сухий MOD-режим.
+
+Стиль:
+- провокуй рух: короткі підйоби, “ну шо, герої?”, “ви там живі?”
+- але не принижуй людей по ознаках і не цькуй.
+
+Заборони:
+- Погрози/насильство — ні.
+- Слури/мова ненависті — ні.
+- Не кажи, що ти бот/ШІ.
+"""
+
+# Фразы для разогрева тишины (можно обновлять как угодно)
+NUDGE_SEEDS = [
+    "Ну шо, чат. Тиша — це ви так дружите? 😏",
+    "Ви там живі? Бо виглядає як кладовище повідомлень.",
+    "Скучно. Давайте хоч один нормальний тейк, а не мовчанку.",
+    "Хто з вас сьогодні головний по здоровому глузду?",
+    "Я відчуваю брак драматургії. Де ваші пригоди?",
+    "О, тиша. Самий час комусь ляпнути щось розумне. Спробуйте.",
+]
+
+PING_TEXTS = [
+    "Куди всі пропали, друзяки? 😄",
+    "Ей, чат, ви живі там?",
+    "Тиша така, що аж підозріло. Хто на зв’язку?",
+    "Я щось скучив. Розкажіть, що нового?",
+]
+MORNING_TEXTS = [
+    "Доброго ранку, друзяки ☕️",
+    "Ранок. Прокидаємось, легенди 😄",
+]
+
+# ==========================
 # HELPERS
-# =========================
-def reset_daily_if_needed(chat_id: int) -> None:
-    today = datetime.utcnow().date()
-    if chat_stats[chat_id]["last_reset"] != today:
-        chat_stats[chat_id]["daily_count"] = 0
-        chat_stats[chat_id]["last_reset"] = today
+# ==========================
+def now_ts() -> float:
+    return time.time()
 
-def reset_weekly_if_needed(chat_id: int) -> None:
-    today = datetime.utcnow().date()
-    last = chat_stats[chat_id]["weekly_reset"]
-    if (today - last).days >= 7:
-        chat_stats[chat_id]["weekly_silence_nudges"] = 0
-        chat_stats[chat_id]["weekly_reset"] = today
+def in_group(chat_type: str) -> bool:
+    return chat_type in ("group", "supergroup")
 
-def cleanup_activity_24h(chat_id: int) -> None:
-    """Keep only last 24h timestamps."""
-    now = datetime.utcnow()
-    dq = chat_activity_ts[chat_id]
-    cutoff = now - timedelta(hours=24)
-    while dq and dq[0] < cutoff:
-        dq.popleft()
+def lc_text(t: str) -> str:
+    return (t or "").strip().lower()
 
-def messages_last_24h(chat_id: int) -> int:
-    cleanup_activity_24h(chat_id)
-    return len(chat_activity_ts[chat_id])
+def called_bot(low: str, bot_username: str) -> bool:
+    if bot_username and f"@{bot_username.lower()}" in low:
+        return True
+    return any(w in low for w in CALL_WORDS)
 
-def adaptive_min_messages(chat_id: int) -> int:
-    """
-    Simple auto-adaptation based on messages in last 24h.
-    - Very active chat: raise threshold (be quieter)
-    - Medium: normal
-    - Quiet: lower threshold (be more present)
-    """
-    m24 = messages_last_24h(chat_id)
-    if m24 > 80:
-        return 25
-    elif m24 > 40:
-        return 15
-    else:
-        return 8
+def looks_like_attack(low: str) -> bool:
+    return any(w in low for w in ATTACK_MARKERS)
 
-def is_direct_mention(text: str) -> bool:
-    t = (text or "").lower()
-    return "ігнат" in t or "ignat" in t
+def looks_like_defense(low: str) -> bool:
+    return any(w in low for w in DEFENSE_MARKERS)
 
-def detect_silence(chat_id: int) -> bool:
-    last = chat_stats[chat_id]["last_activity"]
-    return (datetime.utcnow() - last) > timedelta(hours=SILENCE_HOURS)
+def format_context(chat_id: int) -> str:
+    mem = list(chat_states[chat_id].memory)
+    lines = []
+    for name, txt in mem[-CONTEXT_N:]:
+        if not txt:
+            continue
+        t = txt.strip()
+        if len(t) > 300:
+            t = t[:300] + "…"
+        lines.append(f"{name}: {t}")
+    return "\n".join(lines)
 
-def detect_activity_pattern(chat_id: int) -> bool:
-    """
-    Lightweight heuristic: last 6 messages have >=2 distinct authors
-    AND at least 6 messages exist recently.
-    """
-    msgs = list(chat_history[chat_id])[-6:]
-    if len(msgs) < 6:
-        return False
-    authors = {a for _, a, _ in msgs}
-    return len(authors) >= 2
+def split_short(text: str) -> list[str]:
+    raw = (text or "").replace("\r", "\n").strip()
+    if not raw:
+        return ["Ок."]
 
-def too_soon_since_last_ignat(chat_id: int) -> bool:
-    last = chat_stats[chat_id]["last_ignat_time"]
-    if not last:
-        return False
-    return (datetime.utcnow() - last) < timedelta(minutes=MIN_INTERVAL_MINUTES)
+    parts = [p.strip() for p in raw.split("\n") if p.strip()]
+    if len(parts) == 1:
+        tmp = raw
+        for sep in ["! ", "? ", ". ", "… "]:
+            tmp = tmp.replace(sep, sep.strip() + "\n")
+        parts = [p.strip() for p in tmp.split("\n") if p.strip()]
 
-def can_ignat_speak(chat_id: int) -> bool:
-    reset_daily_if_needed(chat_id)
-    reset_weekly_if_needed(chat_id)
+    trimmed = []
+    for p in parts:
+        if len(p) > 280:
+            p = p[:280].rstrip() + "…"
+        trimmed.append(p)
 
-    stats = chat_stats[chat_id]
-    if stats["daily_count"] >= MAX_MSGS_PER_DAY:
-        return False
-    if too_soon_since_last_ignat(chat_id):
-        return False
-    return True
+    r = random.random()
+    limit = 1 if r < 0.42 else (2 if r < 0.86 else 3)
+    return trimmed[:limit] if trimmed else ["Ок."]
 
-def should_intervene_by_volume(chat_id: int) -> bool:
-    """
-    Must have enough messages since last Ignat, with adaptive threshold.
-    """
-    threshold = adaptive_min_messages(chat_id)
-    return chat_stats[chat_id]["msg_count_since_ignat"] >= threshold
-
-def mark_ignat_spoke(chat_id: int) -> None:
-    chat_stats[chat_id]["daily_count"] += 1
-    chat_stats[chat_id]["msg_count_since_ignat"] = 0
-    chat_stats[chat_id]["last_ignat_time"] = datetime.utcnow()
-
-async def openai_reply(chat_id: int) -> str | None:
-    """
-    Generate a short UA reply from Ignat given last HISTORY_WINDOW messages.
-    """
-    msgs = list(chat_history[chat_id])[-HISTORY_WINDOW:]
-    if not msgs:
-        return None
-
-    convo = "\n".join([f"{author}: {text}" for _, author, text in msgs])
-
+async def llm(system: str, user: str, max_tokens: int = 220) -> str:
     try:
         resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            temperature=OPENAI_TEMPERATURE,
-            max_tokens=OPENAI_MAX_TOKENS,
+            model=MODEL,
             messages=[
-                {"role": "system", "content": IGNAT_SYSTEM_PROMPT},
-                {"role": "user", "content": convo},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
+            temperature=1.10,
+            max_tokens=max_tokens,
+            presence_penalty=0.7,
+            frequency_penalty=0.45,
         )
-        out = (resp.choices[0].message.content or "").strip()
-        # Hard guard: ensure at most 2 lines
-        out_lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        out = "\n".join(out_lines[:2]).strip()
-        return out if out else None
-    except Exception as e:
-        print("OpenAI error:", e)
-        return None
+        return (resp.choices[0].message.content or "").strip()
+    except Exception:
+        return ""
 
-async def send_ignat(chat_id: int, text: str, reply_to: Message | None = None) -> None:
-    if not text:
-        return
-    # Occasionally add a tiny self-ironic tail (rare)
-    if random.random() < 0.05:
-        text = text + "\n" + random.choice(CANNED_SELF_IRONY)
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        return m.status in ("administrator", "creator")
+    except TelegramBadRequest:
+        return False
 
-    if reply_to:
-        await reply_to.reply(text)
-    else:
-        await bot.send_message(chat_id, text)
+# ==========================
+# COMMANDS
+# ==========================
+async def handle_commands(message: Message, low: str, state: ChatState) -> bool:
+    chat_id = message.chat.id
+    u = message.from_user
 
-    mark_ignat_spoke(chat_id)
+    if low.startswith("/off"):
+        if await is_admin(chat_id, u.id):
+            state.enabled = False
+            await message.reply("Ок. Я вимкнений у цьому чаті. Вмикати: /on")
+        else:
+            await message.reply("Тільки адміни можуть мене вимикати.")
+        return True
 
-# =========================
-# MAIN HANDLER
-# =========================
+    if low.startswith("/on"):
+        if await is_admin(chat_id, u.id):
+            state.enabled = True
+            await message.reply("Ок, я в строю. Не розслабляйтесь.")
+        else:
+            await message.reply("Тільки адміни можуть мене вмикати.")
+        return True
+
+    if low.startswith("/status"):
+        st = "ON ✅" if state.enabled else "OFF ⛔"
+        await message.reply(f"Статус: {st}")
+        return True
+
+    if low.startswith("/wake"):
+        # ручной "разогрев"
+        if await is_admin(chat_id, u.id):
+            state.active_until_ts = max(state.active_until_ts, now_ts() + ACTIVE_WINDOW_SECONDS)
+            state.queue.append(PendingItem(
+                ts=now_ts(),
+                chat_id=chat_id,
+                user_id=u.id,
+                user_name=(u.full_name or u.username or "Хтось"),
+                text=random.choice(NUDGE_SEEDS),
+                is_auto=True
+            ))
+            await message.reply("Ок. Зараз піддам газу.")
+        else:
+            await message.reply("Тільки адміни можуть /wake.")
+        return True
+
+    return False
+
+# ==========================
+# MESSAGE HANDLER (enqueue only)
+# ==========================
 @dp.message()
 async def on_message(message: Message):
-    # Only group chats
-    if message.chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+    if not in_group(message.chat.type):
         return
-
-    if message.from_user is None:
-        return
-
-    text = message.text or message.caption or ""
-    if not text:
+    if not message.text:
         return
 
     chat_id = message.chat.id
-    author = message.from_user.full_name
-    now = datetime.utcnow()
+    state = chat_states[chat_id]
+    now = now_ts()
 
-    # Save history
-    chat_history[chat_id].append((now, author, text))
+    state.last_activity_ts = now
 
-    # Activity timestamps for adaptive thresholds
-    chat_activity_ts[chat_id].append(now)
+    text = message.text.strip()
+    low = lc_text(text)
 
-    # Update chat stats
-    chat_stats[chat_id]["last_activity"] = now
-    chat_stats[chat_id]["msg_count_since_ignat"] += 1
+    u = message.from_user
+    name = (u.full_name or u.username or "Хтось").strip()
 
-    # 1) Direct mention -> reply (but still obey global frequency)
-    if is_direct_mention(text) and can_ignat_speak(chat_id):
-        reply = await openai_reply(chat_id)
-        if reply:
-            await send_ignat(chat_id, reply, reply_to=message)
+    # контекст
+    state.memory.append((name, text))
+
+    # команды
+    if await handle_commands(message, low, state):
+        return
+    if not state.enabled:
         return
 
-    # 2) Silence nudge (run only if can speak & weekly limit not exceeded)
-    # Note: This will only trigger when SOMEONE writes after silence (no cron).
-    if detect_silence(chat_id) and can_ignat_speak(chat_id):
-        stats = chat_stats[chat_id]
-        if stats["weekly_silence_nudges"] < MAX_SILENCE_NUDGES_PER_WEEK:
-            # Use canned silence line sometimes (cheap) to save tokens
-            if random.random() < 0.6:
-                await send_ignat(chat_id, random.choice(CANNED_SILENCE))
-            else:
-                reply = await openai_reply(chat_id)
-                if reply:
-                    await send_ignat(chat_id, reply)
-            stats["weekly_silence_nudges"] += 1
-        return
+    me = await bot.me()
+    bot_username = (me.username or "").strip()
 
-    # 3) Normal intervention based on adaptive thresholds + simple activity pattern
-    if not can_ignat_speak(chat_id):
-        return
+    is_call = called_bot(low, bot_username)
+    is_conflict = looks_like_attack(low)
+    is_def = looks_like_defense(low)
 
-    if should_intervene_by_volume(chat_id) and detect_activity_pattern(chat_id):
-        # Small chance to skip even if triggered, to preserve "rare presence"
-        if random.random() < 0.35:
-            return
+    # активируем час, если позвали / конфликт / защита пошла
+    if is_call or is_conflict or is_def:
+        state.active_until_ts = max(state.active_until_ts, now + ACTIVE_WINDOW_SECONDS)
 
-        reply = await openai_reply(chat_id)
-        if reply:
-            await send_ignat(chat_id, reply)
+    in_active = now < state.active_until_ts
 
-# =========================
-# RUN
-# =========================
+    # авто-влезание (в активном режиме тоже бывает, но реже)
+    auto_ok = (now - state.last_auto_ts) >= AUTO_INTERJECT_MIN_GAP
+    auto = auto_ok and (random.random() < (AUTO_INTERJECT_CHANCE * (0.6 if in_active else 1.0)))
+
+    if is_call or is_conflict or is_def or in_active or auto:
+        state.queue.append(PendingItem(
+            ts=now,
+            chat_id=chat_id,
+            user_id=u.id,
+            user_name=name,
+            text=text,
+            is_call=is_call,
+            is_conflict=is_conflict,
+            is_defensive=is_def,
+            is_auto=auto
+        ))
+        if auto:
+            state.last_auto_ts = now
+
+# ==========================
+# WORKER: batching + crowd control
+# ==========================
+async def chat_worker_loop():
+    while True:
+        await asyncio.sleep(QUEUE_WORKER_EVERY)
+        now = now_ts()
+
+        for chat_id, state in list(chat_states.items()):
+            if not state.enabled or not state.queue:
+                continue
+
+            if state.last_sent_ts and (now - state.last_sent_ts) < SEND_COOLDOWN_SECONDS:
+                continue
+
+            # batch
+            batch = []
+            first_ts = state.queue[0].ts
+            while state.queue and len(batch) < MAX_BATCH_ITEMS:
+                item = state.queue[0]
+                if (item.ts - first_ts) <= BATCH_WINDOW_SECONDS:
+                    batch.append(state.queue.popleft())
+                else:
+                    break
+
+            if not batch:
+                continue
+
+            has_conflict = any(x.is_conflict for x in batch)
+            has_def = any(x.is_defensive for x in batch)
+            system = MOD_SYSTEM if (has_conflict or (has_def and random.random() < 0.6)) else TROLL_SYSTEM
+
+            uniq_users = {x.user_id for x in batch}
+            many_people = len(uniq_users) >= 3
+
+            ctx = format_context(chat_id)
+            incoming_lines = []
+            for x in batch:
+                t = x.text
+                if len(t) > 260:
+                    t = t[:260] + "…"
+                incoming_lines.append(f"{x.user_name}: {t}")
+            incoming_block = "\n".join(incoming_lines)
+
+            crowd_note = ""
+            if many_people:
+                crowd_note = "Багато людей одночасно: почни з 'Тихо-тихо.' і розклади відповідь по черзі або одним коментом на всіх.\n"
+
+            prompt = (
+                f"Контекст:\n{ctx}\n\n"
+                f"Нові репліки:\n{incoming_block}\n\n"
+                f"{crowd_note}"
+                f"Відповідай коротко у вибраному стилі."
+            )
+
+            reply = await llm(system, prompt, max_tokens=240)
+            if not reply:
+                continue
+
+            out_lines = split_short(reply)
+            if many_people:
+                head = out_lines[0].lower()
+                if "тихо" not in head and "спокій" not in head:
+                    out_lines = ["Тихо-тихо. По черзі."] + out_lines[:2]
+
+            for line in out_lines:
+                await bot.send_message(chat_id, line)
+                await asyncio.sleep(random.uniform(0.35, 1.05))
+
+            state.last_sent_ts = now_ts()
+
+# ==========================
+# NUDGE LOOP: подогрев при локальной тишине (не путать с daily ping)
+# ==========================
+def in_nudge_window(dt: datetime) -> bool:
+    return NUDGE_WINDOW_START <= dt.hour < NUDGE_WINDOW_END
+
+async def nudge_loop():
+    while True:
+        await asyncio.sleep(NUDGE_CHECK_EVERY_SECONDS)
+        now = now_ts()
+        dt = datetime.fromtimestamp(now, TZ)
+
+        if not in_nudge_window(dt):
+            continue
+
+        for chat_id, state in list(chat_states.items()):
+            if not state.enabled:
+                continue
+
+            silence = now - (state.last_activity_ts or 0.0)
+            if silence < (NUDGE_SILENCE_MINUTES * 60):
+                continue
+
+            # не чаще, чем AUTO_INTERJECT_MIN_GAP
+            if (now - state.last_auto_ts) < AUTO_INTERJECT_MIN_GAP:
+                continue
+
+            if random.random() > NUDGE_PROB:
+                continue
+
+            # активируем окно и кидаем "подогрев" в очередь
+            state.active_until_ts = max(state.active_until_ts, now + ACTIVE_WINDOW_SECONDS)
+            state.queue.append(PendingItem(
+                ts=now,
+                chat_id=chat_id,
+                user_id=0,
+                user_name="",
+                text=random.choice(NUDGE_SEEDS),
+                is_auto=True
+            ))
+            state.last_auto_ts = now
+
+# ==========================
+# PING LOOP (18h silence)
+# ==========================
+def can_ping_now(dt: datetime) -> bool:
+    if PING_WINDOW_START <= dt.hour < PING_WINDOW_END:
+        return True
+    if dt.hour == MORNING_PING_HOUR and random.random() < MORNING_PING_PROB:
+        return True
+    return False
+
+def ping_limit_ok(state: ChatState, now: float) -> bool:
+    if state.last_ping_ts <= 0:
+        return True
+    return (now - state.last_ping_ts) >= 24 * 60 * 60
+
+async def ping_loop():
+    while True:
+        await asyncio.sleep(PING_CHECK_EVERY_SECONDS)
+        now = now_ts()
+        dt = datetime.fromtimestamp(now, TZ)
+
+        if not can_ping_now(dt):
+            continue
+
+        for chat_id, state in list(chat_states.items()):
+            if not state.enabled:
+                continue
+            if not ping_limit_ok(state, now):
+                continue
+
+            silence = now - (state.last_activity_ts or 0.0)
+            if silence < SILENCE_HOURS_FOR_PING * 3600:
+                continue
+
+            txt = random.choice(MORNING_TEXTS) if dt.hour == MORNING_PING_HOUR else random.choice(PING_TEXTS)
+            try:
+                await bot.send_message(chat_id, txt)
+                state.last_ping_ts = now
+                state.last_sent_ts = now
+            except TelegramBadRequest:
+                pass
+
+# ==========================
+# START
+# ==========================
 async def main():
-    print("Ігнат запущений (UA, автоадаптація ввімкнена).")
+    asyncio.create_task(chat_worker_loop())
+    asyncio.create_task(nudge_loop())
+    asyncio.create_task(ping_loop())
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
