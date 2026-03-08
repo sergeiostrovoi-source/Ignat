@@ -33,27 +33,35 @@ MODEL = "gpt-4.1-mini"
 # ==========================
 # CONFIG
 # ==========================
-CONTEXT_N = 60                  # лучше держит нить
-ACTIVE_WINDOW_SECONDS = 60 * 60 # 1 час "в теме" после вызова/конфликта
+CONTEXT_N = 60
+ACTIVE_WINDOW_SECONDS = 60 * 60  # 1 година активного режиму
 
-# очередь/пейсинг
+# черга / батчинг
 QUEUE_WORKER_EVERY = 1.4
 BATCH_WINDOW_SECONDS = 8.0
 MAX_BATCH_ITEMS = 7
-SEND_COOLDOWN_SECONDS = 4.8     # быстрее отвечает
+SEND_COOLDOWN_SECONDS = 4.8
 
-# "краски": чаще сам влезает в разговор, но не флудит
-AUTO_INTERJECT_CHANCE = 0.18    # чаще, чем раньше (было ~0.10)
-AUTO_INTERJECT_MIN_GAP = 8 * 60 # минимум 8 минут между самовбросами
+# авто-вкиди
+AUTO_INTERJECT_CHANCE = 0.18
+AUTO_INTERJECT_MIN_GAP = 8 * 60
 
-# "анти-тишина": если чат затих — он подогревает
-NUDGE_SILENCE_MINUTES = 45      # если тишина ≥ 45 мин — может подкинуть реплику
-NUDGE_CHECK_EVERY_SECONDS = 120 # проверяем раз в 2 минуты
-NUDGE_PROB = 0.55               # шанс сделать подогрев, когда условия выполнены
-NUDGE_WINDOW_START = 10         # 10:00
-NUDGE_WINDOW_END = 23           # до 23:00
+# локальний anti-silence
+NUDGE_SILENCE_MINUTES = 45
+NUDGE_CHECK_EVERY_SECONDS = 120
+NUDGE_PROB = 0.55
+NUDGE_WINDOW_START = 10
+NUDGE_WINDOW_END = 23
 
-# daily ping при большой тишине
+# daily low-activity ping
+LOW_ACTIVITY_WINDOW_HOURS = 24
+LOW_ACTIVITY_MAX_MESSAGES = 3
+DAILY_LOW_ACTIVITY_WINDOW_START = 10
+DAILY_LOW_ACTIVITY_WINDOW_END = 22
+DAILY_LOW_ACTIVITY_CHECK_EVERY_SECONDS = 300  # 5 хв
+MAX_LOW_ACTIVITY_PINGS_PER_24H = 1
+
+# daily long silence ping
 SILENCE_HOURS_FOR_PING = 18
 PING_WINDOW_START = 10
 PING_WINDOW_END = 22
@@ -89,6 +97,10 @@ class ChatState:
     queue: deque = field(default_factory=deque)
 
     last_ping_ts: float = 0.0
+    last_low_activity_ping_ts: float = 0.0
+
+    # для підрахунку активності за 24 години
+    activity_timestamps: deque = field(default_factory=deque)
 
 chat_states: dict[int, ChatState] = defaultdict(ChatState)
 
@@ -120,43 +132,37 @@ MOD_SYSTEM = """
 
 Правила:
 - ЛИШЕ українською.
-- Коротко: 1–2 репліки (інколи 3, якщо натовп).
+- Коротко: 1–2 репліки.
 - Мат дозволений.
-- Принцип: переважно ругай дію/поведінку ("це хамство", "це зайва агресія"),
-  інколи можеш різко вдарити по статусу в моменті ("це слабко", "виглядаєш дрібно"),
-  але НЕ використовуй слури/мову ненависті.
-- Нуль флірту/жартів у конфлікті.
-- Якщо хтось захищається в культурній тональності — коротко: "що сталося?" і "по фактах".
+- Переважно ругай дію/поведінку, а не людину.
+- У конфлікті нуль флірту і нуль дурних жартів.
+- Якщо хтось захищається культурно — коротко спитай, що сталося, і поверни всіх до фактів.
 
 Заборони:
-- Без слурів/мови ненависті.
+- Без мови ненависті.
 - Без погроз реальної шкоди.
 - Не кажи, що ти бот/ШІ.
 """
 
 TROLL_SYSTEM = """
-Ти — злий, язвительный, дуже неприємний троль українського чату, який додає "красок" у тишу.
+Ти — злий, язвительный, дуже неприємний троль українського чату, який додає красок у тишу.
 Ти дотепний, колючий, з матом, але не перетворюєш чат у травлю.
 
 Правила:
 - ЛИШЕ українською.
-- 1–2 короткі репліки (інколи 3).
-- Мат можна вільно (хуй/залупа/пізда тощо), але без слурів/мови ненависті.
-- Частіше ругай дію/поведінку. Іноді — по статусу в моменті ("слабко", "дрібно", "нуль аргументів").
+- 1–2 короткі репліки, інколи 3.
+- Мат можна вільно.
+- Частіше ругай дію/поведінку.
+- Іноді можеш жорстко вдарити по статусу в моменті: "слабко", "дрібно", "аргумент нуль".
 - Якщо багато людей пишуть одночасно — почни з "Тихо-тихо." і відповідай по черзі або одним коментом на всіх.
-- Якщо відчуваєш конфлікт — перемикайся в сухий MOD-режим.
-
-Стиль:
-- провокуй рух: короткі підйоби, “ну шо, герої?”, “ви там живі?”
-- але не принижуй людей по ознаках і не цькуй.
+- Якщо бачиш конфлікт — перемикайся в сухий MOD-режим.
 
 Заборони:
-- Погрози/насильство — ні.
-- Слури/мова ненависті — ні.
+- Без мови ненависті.
+- Без погроз/насильства.
 - Не кажи, що ти бот/ШІ.
 """
 
-# Фразы для разогрева тишины (можно обновлять как угодно)
 NUDGE_SEEDS = [
     "Ну шо, чат. Тиша — це ви так дружите? 😏",
     "Ви там живі? Бо виглядає як кладовище повідомлень.",
@@ -172,9 +178,20 @@ PING_TEXTS = [
     "Тиша така, що аж підозріло. Хто на зв’язку?",
     "Я щось скучив. Розкажіть, що нового?",
 ]
+
 MORNING_TEXTS = [
     "Доброго ранку, друзяки ☕️",
     "Ранок. Прокидаємось, легенди 😄",
+]
+
+LOW_ACTIVITY_PINGS = [
+    "Альо, де всі? Дайте хоч знак, що живі.",
+    "Щось чат підозріло тихий. Всі цілі?",
+    "Ей, народ, відпишіться хоч хтось. Бо тиша вже нездорова.",
+    "Де ви поділись? Чат виглядає так, ніби всі випарувались.",
+    "Ну й тиша. Хто живий — маякніть.",
+    "Чат здох чи що? Хоч один відпишіться.",
+    "Альо, де всі? Дайте знати, що живі, бо я вже починаю переживати.",
 ]
 
 # ==========================
@@ -258,6 +275,11 @@ async def is_admin(chat_id: int, user_id: int) -> bool:
     except TelegramBadRequest:
         return False
 
+def trim_activity(state: ChatState, now: float):
+    cutoff = now - (LOW_ACTIVITY_WINDOW_HOURS * 3600)
+    while state.activity_timestamps and state.activity_timestamps[0] < cutoff:
+        state.activity_timestamps.popleft()
+
 # ==========================
 # COMMANDS
 # ==========================
@@ -287,7 +309,6 @@ async def handle_commands(message: Message, low: str, state: ChatState) -> bool:
         return True
 
     if low.startswith("/wake"):
-        # ручной "разогрев"
         if await is_admin(chat_id, u.id):
             state.active_until_ts = max(state.active_until_ts, now_ts() + ACTIVE_WINDOW_SECONDS)
             state.queue.append(PendingItem(
@@ -306,7 +327,7 @@ async def handle_commands(message: Message, low: str, state: ChatState) -> bool:
     return False
 
 # ==========================
-# MESSAGE HANDLER (enqueue only)
+# MESSAGE HANDLER
 # ==========================
 @dp.message()
 async def on_message(message: Message):
@@ -320,6 +341,8 @@ async def on_message(message: Message):
     now = now_ts()
 
     state.last_activity_ts = now
+    state.activity_timestamps.append(now)
+    trim_activity(state, now)
 
     text = message.text.strip()
     low = lc_text(text)
@@ -327,10 +350,8 @@ async def on_message(message: Message):
     u = message.from_user
     name = (u.full_name or u.username or "Хтось").strip()
 
-    # контекст
     state.memory.append((name, text))
 
-    # команды
     if await handle_commands(message, low, state):
         return
     if not state.enabled:
@@ -343,13 +364,10 @@ async def on_message(message: Message):
     is_conflict = looks_like_attack(low)
     is_def = looks_like_defense(low)
 
-    # активируем час, если позвали / конфликт / защита пошла
     if is_call or is_conflict or is_def:
         state.active_until_ts = max(state.active_until_ts, now + ACTIVE_WINDOW_SECONDS)
 
     in_active = now < state.active_until_ts
-
-    # авто-влезание (в активном режиме тоже бывает, но реже)
     auto_ok = (now - state.last_auto_ts) >= AUTO_INTERJECT_MIN_GAP
     auto = auto_ok and (random.random() < (AUTO_INTERJECT_CHANCE * (0.6 if in_active else 1.0)))
 
@@ -369,7 +387,7 @@ async def on_message(message: Message):
             state.last_auto_ts = now
 
 # ==========================
-# WORKER: batching + crowd control
+# WORKER
 # ==========================
 async def chat_worker_loop():
     while True:
@@ -383,7 +401,6 @@ async def chat_worker_loop():
             if state.last_sent_ts and (now - state.last_sent_ts) < SEND_COOLDOWN_SECONDS:
                 continue
 
-            # batch
             batch = []
             first_ts = state.queue[0].ts
             while state.queue and len(batch) < MAX_BATCH_ITEMS:
@@ -440,7 +457,7 @@ async def chat_worker_loop():
             state.last_sent_ts = now_ts()
 
 # ==========================
-# NUDGE LOOP: подогрев при локальной тишине (не путать с daily ping)
+# NUDGE LOOP
 # ==========================
 def in_nudge_window(dt: datetime) -> bool:
     return NUDGE_WINDOW_START <= dt.hour < NUDGE_WINDOW_END
@@ -462,14 +479,12 @@ async def nudge_loop():
             if silence < (NUDGE_SILENCE_MINUTES * 60):
                 continue
 
-            # не чаще, чем AUTO_INTERJECT_MIN_GAP
             if (now - state.last_auto_ts) < AUTO_INTERJECT_MIN_GAP:
                 continue
 
             if random.random() > NUDGE_PROB:
                 continue
 
-            # активируем окно и кидаем "подогрев" в очередь
             state.active_until_ts = max(state.active_until_ts, now + ACTIVE_WINDOW_SECONDS)
             state.queue.append(PendingItem(
                 ts=now,
@@ -482,7 +497,47 @@ async def nudge_loop():
             state.last_auto_ts = now
 
 # ==========================
-# PING LOOP (18h silence)
+# DAILY LOW ACTIVITY LOOP
+# ==========================
+def in_daily_low_activity_window(dt: datetime) -> bool:
+    return DAILY_LOW_ACTIVITY_WINDOW_START <= dt.hour < DAILY_LOW_ACTIVITY_WINDOW_END
+
+def low_activity_ping_limit_ok(state: ChatState, now: float) -> bool:
+    if state.last_low_activity_ping_ts <= 0:
+        return True
+    return (now - state.last_low_activity_ping_ts) >= 24 * 60 * 60
+
+async def low_activity_loop():
+    while True:
+        await asyncio.sleep(DAILY_LOW_ACTIVITY_CHECK_EVERY_SECONDS)
+        now = now_ts()
+        dt = datetime.fromtimestamp(now, TZ)
+
+        if not in_daily_low_activity_window(dt):
+            continue
+
+        for chat_id, state in list(chat_states.items()):
+            if not state.enabled:
+                continue
+
+            trim_activity(state, now)
+            msg_count = len(state.activity_timestamps)
+
+            if msg_count > LOW_ACTIVITY_MAX_MESSAGES:
+                continue
+
+            if not low_activity_ping_limit_ok(state, now):
+                continue
+
+            try:
+                await bot.send_message(chat_id, random.choice(LOW_ACTIVITY_PINGS))
+                state.last_low_activity_ping_ts = now
+                state.last_sent_ts = now
+            except TelegramBadRequest:
+                pass
+
+# ==========================
+# LONG SILENCE PING LOOP
 # ==========================
 def can_ping_now(dt: datetime) -> bool:
     if PING_WINDOW_START <= dt.hour < PING_WINDOW_END:
@@ -529,6 +584,7 @@ async def ping_loop():
 async def main():
     asyncio.create_task(chat_worker_loop())
     asyncio.create_task(nudge_loop())
+    asyncio.create_task(low_activity_loop())
     asyncio.create_task(ping_loop())
     await dp.start_polling(bot)
 
