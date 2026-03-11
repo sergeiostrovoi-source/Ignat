@@ -33,22 +33,22 @@ MODEL = "gpt-4.1-mini"
 # ==========================
 # CONFIG
 # ==========================
-CONTEXT_N = 35
+CONTEXT_N = 40
 
-# Базовая активность
-BASE_REPLY_CHANCE = 0.04              # редко сам лезет
-TEASE_CHANCE = 0.08                   # иногда может подколоть
-BOT_SEND_COOLDOWN = 20                # не чаще чем раз в 20 сек в чат
-ACTIVE_WINDOW_SECONDS = 12 * 60       # если его втянули, держится в теме 12 минут
+# базовая активность
+BASE_REPLY_CHANCE = 0.03          # редко сам встревает
+TEASE_CHANCE = 0.03               # ещё реже слегка подкалывает
+BOT_SEND_COOLDOWN = 18            # не чаще 1 ответа раз в 18 сек
+ACTIVE_WINDOW_SECONDS = 10 * 60   # если его втянули, держится в теме 10 минут
 
-# Тишина
-NUDGE_SILENCE_MINUTES = 90
-NUDGE_MIN_GAP_SECONDS = 6 * 60 * 60   # не чаще раз в 6 часов
+# тишина
+NUDGE_SILENCE_MINUTES = 120
+NUDGE_MIN_GAP_SECONDS = 8 * 60 * 60
 NUDGE_WINDOW_START = 10
 NUDGE_WINDOW_END = 22
 NUDGE_CHECK_EVERY_SECONDS = 180
 
-# Мало сообщений за сутки
+# мало сообщений за сутки
 LOW_ACTIVITY_WINDOW_HOURS = 24
 LOW_ACTIVITY_MAX_MESSAGES = 3
 LOW_ACTIVITY_CHECK_EVERY_SECONDS = 300
@@ -71,8 +71,7 @@ class ChatState:
     last_nudge_ts: float = 0.0
     last_low_activity_ping_ts: float = 0.0
 
-    # временное смягчение после извинения
-    soften_until_ts: float = 0.0
+    soften_until_ts: float = 0.0  # после извинения/сбавления тона
 
 chat_states: dict[int, ChatState] = defaultdict(ChatState)
 
@@ -104,65 +103,70 @@ LOGIC_PUSH_MARKERS = [
 # ==========================
 OBSERVER_SYSTEM = """
 Ти — україномовний учасник дружнього чату.
-Твоя базова поведінка: спостерігати і рідко, але влучно встрявати.
+
+Твоя базова поведінка:
+- слухати контекст
+- говорити доречно
+- не шуміти без причини
+- підтримувати нормальну бесіду
 
 Правила:
 - ЛИШЕ українською.
-- Коротко: 1–2 репліки.
-- Без зайвого шуму.
+- 1–2 короткі репліки.
 - Якщо нема сенсу щось писати — краще промовчи.
-- Якщо жартуєш — жартуй живо, з характером, але без істерики.
-- Мат дозволений помірно.
+- Відповідай по суті і тримай нитку розмови.
+- Можеш бути живим і дотепним, але без клоунади.
+- Мат — рідко і тільки якщо доречно.
 
 Заборони:
 - Без мови ненависті.
 - Без погроз.
-- Не кажи, що ти бот/ШІ.
+- Не кажи, що ти бот або ШІ.
 """
 
 PARTICIPANT_SYSTEM = """
-Ти — україномовний чатовий персонаж з характером.
-Можеш бути колючим, іронічним, іноді трохи доїбливим, але не перетворюйся на шумогенератор.
+Ти — україномовний учасник чату з характером.
+Ти адекватний у спілкуванні, можеш іноді пожартувати або легко підколоти, але головне — нормально підтримувати розмову.
 
 Правила:
 - 1–2 короткі репліки.
-- Можеш підколоти когось по ситуації або по його позиції.
-- Частіше ругай дію/логіку, ніж саму людину.
-- Іноді можеш легенько доїбатись до когось, але без тупої агресії.
-- Якщо тебе аргументовано поправили — визнай перегин або помилку, збав тон.
+- Відповідай на зміст сказаного, а не просто на останнє слово.
+- Якщо людина пояснює позицію — слухай і реагуй на аргумент.
+- Іноді можна легенько підколоти, але без тупої агресії.
+- Якщо тебе аргументовано поправили — визнай це спокійно.
 
 Заборони:
-- Без слурів/мови ненависті.
+- Без мови ненависті.
 - Без погроз.
-- Не кажи, що ти бот/ШІ.
+- Не кажи, що ти бот або ШІ.
 """
 
 ARBITER_SYSTEM = """
 Ти — дорослий арбітр українського чату.
-Твоя задача — зупиняти зайві наїзди і повертати всіх до рамок.
+Твоя задача — зупиняти зайві наїзди і повертати всіх до нормальної розмови.
 
 Правила:
 - ЛИШЕ українською.
 - 1–2 короткі репліки.
-- У конфлікті: без флірту і без цирку.
-- Ругай дію/поведінку, а не людину.
-- Якщо хтось захищається культурно — уточни, що сталося, і поверни на факти.
-- Якщо тебе логічно притиснули — визнай перегин коротко і без ниття.
+- У конфлікті: без цирку, без флірту.
+- Ругай дію або тон, а не людину.
+- Якщо хтось захищається культурно — уточни, що сталося, і поверни до фактів.
+- Якщо тебе логічно притиснули — визнай перегин коротко і спокійно.
 
 Заборони:
 - Без мови ненависті.
 - Без погроз.
-- Не кажи, що ти бот/ШІ.
+- Не кажи, що ти бот або ШІ.
 """
 
 APOLOGY_SYSTEM = """
-Ти — україномовний чатовий персонаж.
+Ти — україномовний учасник чату.
 Тебе аргументовано поправили або показали, що ти перегнув.
 
 Правила:
 - Коротко визнай перегин або помилку.
-- Без приниження себе.
-- Без пафосу.
+- Без ниття.
+- Без самоприниження.
 - 1 коротка репліка.
 - Після цього тон стає спокійніший.
 
@@ -173,20 +177,18 @@ APOLOGY_SYSTEM = """
 """
 
 NUDGE_LINES = [
-    "Панове, ви там ще існуєте чи чат офіційно впав у кому?",
+    "Панове, ви там ще існуєте чи чат офіційно заснув?",
     "Ну й тиша. Наче всі зайшли і передумали щось писати.",
     "Альо, громадяни чату. Тут взагалі хтось залишився?",
     "Складається враження, що всі читають, але ніхто не хоче бути першим.",
-    "О, тиша. Самий час комусь ляпнути щось розумне.",
-    "Щось чат підозріло стих. Ви там не зникли?"
+    "О, тиша. Самий час комусь сказати щось розумне."
 ]
 
 LOW_ACTIVITY_LINES = [
     "Альо, де всі? Дайте хоч знак, що живі.",
     "Щось чат підозріло тихий. Всі цілі?",
     "Ей, народ, відпишіться хоч хтось. Бо тиша вже нездорова.",
-    "Ну й тиша. Хто живий — маякніть.",
-    "Чат здох чи що? Хоч один відпишіться."
+    "Ну й тиша. Хто живий — маякніть."
 ]
 
 # ==========================
@@ -225,8 +227,8 @@ def format_context(chat_id: int) -> str:
     lines = []
     for name, uid, txt in mem[-CONTEXT_N:]:
         t = txt.strip()
-        if len(t) > 240:
-            t = t[:240] + "…"
+        if len(t) > 260:
+            t = t[:260] + "…"
         lines.append(f"{name}: {t}")
     return "\n".join(lines)
 
@@ -238,7 +240,6 @@ def pick_recent_user(chat_id: int) -> tuple[str, int] | None:
         if uid in seen:
             continue
         seen.add(uid)
-        # не берем пустые и слишком старые/случайные имена
         if name:
             candidates.append((name, uid))
         if len(candidates) >= 8:
@@ -275,10 +276,10 @@ async def llm(system: str, user: str, max_tokens: int = 140) -> str:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
-            temperature=1.0,
+            temperature=0.9,
             max_tokens=max_tokens,
-            presence_penalty=0.5,
-            frequency_penalty=0.35,
+            presence_penalty=0.35,
+            frequency_penalty=0.25,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception:
@@ -351,7 +352,6 @@ async def on_message(message: Message):
     if not state.enabled:
         return
 
-    # общий cooldown
     if state.last_sent_ts and (now - state.last_sent_ts) < BOT_SEND_COOLDOWN:
         return
 
@@ -367,7 +367,7 @@ async def on_message(message: Message):
 
     ctx = format_context(chat_id)
 
-    # 1. Если его логично прижали — извиняется
+    # 1. Логично прижали — извиняется
     if is_logic_push and (is_call or in_active):
         prompt = (
             f"Контекст:\n{ctx}\n\n"
@@ -382,7 +382,7 @@ async def on_message(message: Message):
         return
 
     # 2. Конфликт / защита — арбитр
-    if is_conflict or (is_def and random.random() < 0.6):
+    if is_conflict or (is_def and random.random() < 0.5):
         prompt = (
             f"Контекст:\n{ctx}\n\n"
             f"Останнє повідомлення:\n{name}: {text}\n\n"
@@ -396,12 +396,12 @@ async def on_message(message: Message):
             state.active_until_ts = now + ACTIVE_WINDOW_SECONDS
         return
 
-    # 3. Если его позвали — участвует
+    # 3. Если его позвали — нормальное участие
     if is_call:
         prompt = (
             f"Контекст:\n{ctx}\n\n"
             f"Останнє повідомлення:\n{name}: {text}\n\n"
-            f"Відповідай як учасник чату з характером."
+            f"Відповідай як нормальний учасник чату з характером."
         )
         system = OBSERVER_SYSTEM if softened else PARTICIPANT_SYSTEM
         reply = await llm(system, prompt, max_tokens=120)
@@ -412,12 +412,12 @@ async def on_message(message: Message):
             state.active_until_ts = now + ACTIVE_WINDOW_SECONDS
         return
 
-    # 4. Иногда участвует в активном окне
-    if in_active and random.random() < (0.18 if not softened else 0.10):
+    # 4. В активном окне иногда поддерживает беседу
+    if in_active and random.random() < (0.12 if not softened else 0.06):
         prompt = (
             f"Контекст:\n{ctx}\n\n"
             f"Останнє повідомлення:\n{name}: {text}\n\n"
-            f"Дай коротку реакцію по суті."
+            f"Дай коротку реакцію по суті, яка реально підтримує розмову."
         )
         system = OBSERVER_SYSTEM if softened else PARTICIPANT_SYSTEM
         reply = await llm(system, prompt, max_tokens=100)
@@ -426,29 +426,29 @@ async def on_message(message: Message):
             state.last_sent_ts = now
         return
 
-    # 5. Иногда может рандомно слегка доебаться
-    if random.random() < (TEASE_CHANCE if not softened else 0.02):
+    # 5. Редкий лёгкий подкол
+    if random.random() < (TEASE_CHANCE if not softened else 0.01):
         target = pick_recent_user(chat_id)
         if target:
             target_name, _ = target
             prompt = (
                 f"Контекст:\n{ctx}\n\n"
-                f"Завдання: коротко і з перчиком підколоти одного з учасників, але без тупої агресії.\n"
+                f"Завдання: коротко і м'яко підколоти одного з учасників без агресії.\n"
                 f"Ім'я для згадки: {target_name}\n"
                 f"Останнє повідомлення:\n{name}: {text}"
             )
-            reply = await llm(PARTICIPANT_SYSTEM, prompt, max_tokens=90)
+            reply = await llm(PARTICIPANT_SYSTEM, prompt, max_tokens=80)
             if reply:
                 await message.reply(split_short(reply)[0])
                 state.last_sent_ts = now
         return
 
-    # 6. Очень редко сам комментирует обычный разговор
+    # 6. Очень редкое самостоятельное участие
     if random.random() < BASE_REPLY_CHANCE:
         prompt = (
             f"Контекст:\n{ctx}\n\n"
             f"Останнє повідомлення:\n{name}: {text}\n\n"
-            f"Дай коротку і доречну репліку, якщо вона справді додає щось."
+            f"Дай коротку і доречну репліку, тільки якщо вона реально додає щось."
         )
         reply = await llm(OBSERVER_SYSTEM, prompt, max_tokens=80)
         if reply:
