@@ -24,12 +24,15 @@ MIN_DIALOG_MESSAGES = 3
 
 BOT_SEND_COOLDOWN = 15
 
-# ----------------------------
+BASE_REPLY_CHANCE = 0.25
+SPICE_CHANCE = 0.20
+PROVOKE_CHANCE = 0.10
+
+SILENCE_FOR_PROVOKE = 120
+
 
 @dataclass
 class ChatState:
-
-    enabled: bool = True
 
     memory: deque = field(default_factory=lambda: deque(maxlen=CONTEXT_N))
 
@@ -39,21 +42,8 @@ class ChatState:
 
 chat_states: dict[int, ChatState] = defaultdict(ChatState)
 
-# ----------------------------
 
-CALL_WORDS = ["ігнат", "бот"]
-
-QUESTION_TRIGGERS = [
-    "?",
-    "як",
-    "чому",
-    "шо",
-    "хто",
-    "де",
-    "коли",
-]
-
-# ----------------------------
+QUESTION_TRIGGERS = ["?", "як", "чому", "шо", "хто", "де", "коли"]
 
 
 def now():
@@ -61,7 +51,6 @@ def now():
 
 
 def in_group(chat_type):
-
     return chat_type in ("group", "supergroup")
 
 
@@ -70,7 +59,6 @@ def dialog_trigger(text):
     t = text.lower()
 
     for k in QUESTION_TRIGGERS:
-
         if k in t:
             return True
 
@@ -127,20 +115,36 @@ async def llm(system, user):
     return r.choices[0].message.content.strip()
 
 
-SYSTEM_PROMPT = """
+BASE_PROMPT = """
 Ти учасник українського дружнього чату.
 
 Твоя поведінка:
+
 — підтримувати розмову
-— реагувати по змісту
+— відповідати по суті
 — іноді жартувати
 
-Правила:
+Відповідай коротко (1-2 репліки).
+"""
 
-1. Відповідай коротко (1-2 репліки)
-2. Не пиши без сенсу
-3. Не вигадуй факти
-4. Не кажи що ти бот
+
+SPICE_PROMPT = """
+Ти учасник дружнього українського чату.
+
+Зроби легкий саркастичний або дотепний коментар.
+Можеш трохи підколоти, але без агресії.
+
+Коротко.
+"""
+
+
+PROVOKE_PROMPT = """
+Ти учасник чату.
+
+Чат трохи затих.
+
+Напиши короткий вброс або питання,
+щоб розворушити розмову.
 """
 
 
@@ -169,53 +173,32 @@ async def handle(message: Message):
 
     state.last_activity_ts = now_ts
 
-    # ----------------------------
-    # cooldown
-    # ----------------------------
-
     if state.last_sent_ts and now_ts - state.last_sent_ts < BOT_SEND_COOLDOWN:
         return
-
-    # ----------------------------
-    # ждём ветку диалога
-    # ----------------------------
 
     if len(state.memory) < MIN_DIALOG_MESSAGES:
         return
 
-    # ----------------------------
-    # ждём паузу
-    # ----------------------------
-
     if now_ts - state.last_activity_ts < 4:
         return
 
-    # ----------------------------
-    # reply цепочка
-    # ----------------------------
-
-    reply_target = None
-
-    if message.reply_to_message:
-
-        u = message.reply_to_message.from_user
-
-        reply_target = u.username or u.first_name
-
-    # ----------------------------
-    # смысловой триггер
-    # ----------------------------
-
-    if not dialog_trigger(text) and random.random() > 0.15:
-        return
-
-    # ----------------------------
-    # контекст
-    # ----------------------------
-
     ctx = format_context(chat_id)
 
-    if reply_target:
+    mode = "base"
+
+    if random.random() < PROVOKE_CHANCE and now_ts - state.last_activity_ts > SILENCE_FOR_PROVOKE:
+        mode = "provoke"
+
+    elif random.random() < SPICE_CHANCE:
+        mode = "spice"
+
+    elif random.random() < BASE_REPLY_CHANCE:
+        mode = "base"
+
+    else:
+        return
+
+    if mode == "base":
 
         prompt = f"""
 Контекст:
@@ -225,8 +208,23 @@ async def handle(message: Message):
 Останнє повідомлення:
 {name}: {text}
 
-Ти відповідаєш користувачу {reply_target}.
+Підтримай розмову.
 """
+
+        system = BASE_PROMPT
+
+    elif mode == "spice":
+
+        prompt = f"""
+Контекст:
+
+{ctx}
+
+Останнє повідомлення:
+{name}: {text}
+"""
+
+        system = SPICE_PROMPT
 
     else:
 
@@ -234,30 +232,23 @@ async def handle(message: Message):
 Контекст:
 
 {ctx}
-
-Останнє повідомлення:
-{name}: {text}
-
-Якщо доречно — підтримай розмову.
 """
 
-    reply = await llm(SYSTEM_PROMPT, prompt)
+        system = PROVOKE_PROMPT
+
+    reply = await llm(system, prompt)
 
     if reply:
 
         await asyncio.sleep(random.uniform(3, 7))
 
         for line in split_short(reply):
-
             await message.reply(line)
 
         state.last_sent_ts = now()
-
-
-# ----------------------------
+        
 
 async def main():
-
     await dp.start_polling(bot)
 
 
