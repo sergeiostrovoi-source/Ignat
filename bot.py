@@ -9,6 +9,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.types import Message
 from openai import OpenAI
 
+
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
@@ -18,6 +19,9 @@ dp = Dispatcher()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 MODEL = "gpt-4.1-mini"
+
+
+# ===== настройки поведения =====
 
 CONTEXT_N = 15
 MIN_DIALOG_MESSAGES = 3
@@ -31,6 +35,24 @@ PROVOKE_CHANCE = 0.10
 SILENCE_FOR_PROVOKE = 120
 
 
+CALL_WORDS = ["ігнат", "бот"]
+
+
+QUESTION_TRIGGERS = [
+    "?",
+    "як",
+    "чому",
+    "шо",
+    "хто",
+    "де",
+    "коли",
+    "що думаєш",
+    "твоя думка",
+]
+
+
+# ===== состояние чатов =====
+
 @dataclass
 class ChatState:
 
@@ -43,8 +65,7 @@ class ChatState:
 chat_states: dict[int, ChatState] = defaultdict(ChatState)
 
 
-QUESTION_TRIGGERS = ["?", "як", "чому", "шо", "хто", "де", "коли"]
-
+# ===== утилиты =====
 
 def now():
     return time.time()
@@ -60,6 +81,20 @@ def dialog_trigger(text):
 
     for k in QUESTION_TRIGGERS:
         if k in t:
+            return True
+
+    return False
+
+
+def called_bot(text, username):
+
+    t = text.lower()
+
+    if username and f"@{username.lower()}" in t:
+        return True
+
+    for w in CALL_WORDS:
+        if w in t:
             return True
 
     return False
@@ -115,16 +150,17 @@ async def llm(system, user):
     return r.choices[0].message.content.strip()
 
 
+# ===== системные роли =====
+
 BASE_PROMPT = """
 Ти учасник українського дружнього чату.
 
 Твоя поведінка:
-
 — підтримувати розмову
-— відповідати по суті
+— реагувати по суті
 — іноді жартувати
 
-Відповідай коротко (1-2 репліки).
+Відповідай коротко (1–2 репліки).
 """
 
 
@@ -148,6 +184,8 @@ PROVOKE_PROMPT = """
 """
 
 
+# ===== основной обработчик =====
+
 @dp.message()
 async def handle(message: Message):
 
@@ -158,31 +196,86 @@ async def handle(message: Message):
         return
 
     chat_id = message.chat.id
-
     state = chat_states[chat_id]
 
     text = message.text
 
     user = message.from_user
-
     name = user.username or user.first_name or "Хтось"
 
     state.memory.append((name, user.id, text))
 
     now_ts = now()
-
     state.last_activity_ts = now_ts
 
     if state.last_sent_ts and now_ts - state.last_sent_ts < BOT_SEND_COOLDOWN:
         return
 
+    me = await bot.me()
+    bot_username = me.username
+
+    ctx = format_context(chat_id)
+
+
+    # ===== если бота позвали =====
+
+    if called_bot(text, bot_username):
+
+        prompt = f"""
+Контекст:
+
+{ctx}
+
+До тебе звернулись:
+
+{name}: {text}
+
+Відповідай прямо.
+"""
+
+        reply = await llm(BASE_PROMPT, prompt)
+
+        if reply:
+
+            await asyncio.sleep(random.uniform(2,5))
+
+            for line in split_short(reply):
+                await message.reply(line)
+
+            state.last_sent_ts = now()
+
+        return
+
+
+    # ===== ждём ветку =====
+
     if len(state.memory) < MIN_DIALOG_MESSAGES:
         return
+
+
+    # ===== ждём паузу =====
 
     if now_ts - state.last_activity_ts < 4:
         return
 
-    ctx = format_context(chat_id)
+
+    # ===== reply логика =====
+
+    reply_target = None
+
+    if message.reply_to_message:
+
+        u = message.reply_to_message.from_user
+        reply_target = u.username or u.first_name
+
+
+    # ===== смысловой фильтр =====
+
+    if not dialog_trigger(text) and random.random() > 0.15:
+        return
+
+
+    # ===== выбор режима =====
 
     mode = "base"
 
@@ -198,7 +291,10 @@ async def handle(message: Message):
     else:
         return
 
-    if mode == "base":
+
+    # ===== формирование prompt =====
+
+    if reply_target:
 
         prompt = f"""
 Контекст:
@@ -208,23 +304,8 @@ async def handle(message: Message):
 Останнє повідомлення:
 {name}: {text}
 
-Підтримай розмову.
+Ти відповідаєш користувачу {reply_target}.
 """
-
-        system = BASE_PROMPT
-
-    elif mode == "spice":
-
-        prompt = f"""
-Контекст:
-
-{ctx}
-
-Останнє повідомлення:
-{name}: {text}
-"""
-
-        system = SPICE_PROMPT
 
     else:
 
@@ -232,21 +313,36 @@ async def handle(message: Message):
 Контекст:
 
 {ctx}
+
+Останнє повідомлення:
+{name}: {text}
 """
 
+
+    if mode == "base":
+        system = BASE_PROMPT
+
+    elif mode == "spice":
+        system = SPICE_PROMPT
+
+    else:
         system = PROVOKE_PROMPT
+
 
     reply = await llm(system, prompt)
 
+
     if reply:
 
-        await asyncio.sleep(random.uniform(3, 7))
+        await asyncio.sleep(random.uniform(3,7))
 
         for line in split_short(reply):
             await message.reply(line)
 
         state.last_sent_ts = now()
-        
+
+
+# ===== запуск =====
 
 async def main():
     await dp.start_polling(bot)
